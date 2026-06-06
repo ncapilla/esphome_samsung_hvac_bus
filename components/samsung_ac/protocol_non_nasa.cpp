@@ -593,6 +593,23 @@ namespace esphome
             NonNasaRequest request;
             request.dst = dst_address;
 
+            // If there are already pending requests for this address, use the latest one
+            // as the base state to avoid conflicts (e.g. a temp-only change inheriting
+            // power=OFF from the AC while a power=ON request is already queued).
+            for (auto it = nonnasa_requests.rbegin(); it != nonnasa_requests.rend(); ++it)
+            {
+                if (it->request.dst == dst_address)
+                {
+                    request.room_temp = it->request.room_temp;
+                    request.power = it->request.power;
+                    request.target_temp = it->request.target_temp;
+                    request.fanspeed = it->request.fanspeed;
+                    request.mode = it->request.mode;
+                    request.wind_direction = it->request.wind_direction;
+                    return request;
+                }
+            }
+
             auto it = last_command20s_.find(dst_address);
             if (it != last_command20s_.end())
             {
