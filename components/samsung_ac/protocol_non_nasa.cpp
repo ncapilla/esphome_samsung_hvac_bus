@@ -952,6 +952,7 @@ namespace esphome
                 // We have received a request_control message. This is a message outdoor units will
                 // send to a registered controller, allowing us to reply with any control commands.
                 // Control commands should be sent immediately (per SNET Pro behaviour).
+                LOGD("CmdC6 rx: src=%s dst=%s status=%d", nonpacket_.src.c_str(), nonpacket_.dst.c_str(), (int)nonpacket_.commandC6.control_status);
                 if (nonpacket_.src == "c8" && nonpacket_.dst == "d0" && nonpacket_.commandC6.control_status == true)
                 {
                     if (controller_registered == false)
