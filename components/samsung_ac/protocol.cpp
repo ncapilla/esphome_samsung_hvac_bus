@@ -125,7 +125,11 @@ namespace esphome
             if (address == "c8" || address.rfind("10.", 0) == 0)
                 return AddressType::Outdoor;
 
-            if (address == "00" || address == "01" || address == "02" || address == "03" || address.rfind("20.", 0) == 0)
+            // F1/F2 indoor units: 00-03
+            // F3/F4 indoor unit: 84 (wired controller bus)
+            if (address == "00" || address == "01" || address == "02" || address == "03" ||
+                address == "84" ||
+                address.rfind("20.", 0) == 0)
                 return AddressType::Indoor;
 
             return AddressType::Other;

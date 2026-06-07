@@ -285,6 +285,41 @@ namespace esphome
             return str;
         }
 
+        std::string NonNasaCommandA0::to_string()
+        {
+            std::string str;
+            str += "wind_direction:" + std::to_string((uint8_t)wind_direction) + "; ";
+            str += "room_temp:" + room_temp.to_string() + "; ";
+            str += "target_temp:" + target_temp.to_string() + "; ";
+            str += "fanspeed:" + std::to_string((uint8_t)fanspeed) + "; ";
+            str += "mode_encoded:" + std::to_string(mode_encoded) + "; ";
+            str += "power:" + std::to_string(power ? 1 : 0);
+            return str;
+        }
+
+        static NonNasaFanspeed decode_fanspeed_from_request(uint8_t data6)
+        {
+            switch (data6 & 0xE0)
+            {
+            case 0x40: return NonNasaFanspeed::Low;
+            case 0x80: return NonNasaFanspeed::Medium;
+            case 0xA0: return NonNasaFanspeed::High;
+            default:   return NonNasaFanspeed::Auto;
+            }
+        }
+
+        static NonNasaMode encoded_to_nonnasa_mode(uint8_t encoded)
+        {
+            switch (encoded)
+            {
+            case 1: return NonNasaMode::Cool;
+            case 2: return NonNasaMode::Dry;
+            case 3: return NonNasaMode::Fan;
+            case 4: return NonNasaMode::Heat;
+            default: return NonNasaMode::Auto;
+            }
+        }
+
         std::string NonNasaDataPacket::to_string()
         {
             std::string str;
@@ -312,6 +347,12 @@ namespace esphome
             case NonNasaCommand::CmdC6:
             {
                 str += "commandC6:{" + commandC6.to_string() + "}";
+                break;
+            }
+            case NonNasaCommand::CmdA0:
+            case NonNasaCommand::Cmd50:
+            {
+                str += "commandA0:{" + commandA0.to_string() + "}";
                 break;
             }
             case NonNasaCommand::Cmd8D:
@@ -466,6 +507,16 @@ namespace esphome
                 commandF3.inverter_power_w = commandF3.inverter_current_a * 0.1f * commandF3.inverter_voltage_v;
                 return {DecodeResultType::Processed, 14};
 
+            case NonNasaCommand::CmdA0:
+            case NonNasaCommand::Cmd50:
+                commandA0.wind_direction = (NonNasaWindDirection)(data[4]);
+                commandA0.room_temp = {TemperatureUnit::Celsius, data[5]};
+                commandA0.target_temp = {TemperatureUnit::Celsius, (uint8_t)(data[6] & 0x1F)};
+                commandA0.fanspeed = decode_fanspeed_from_request(data[6]);
+                commandA0.mode_encoded = data[7];
+                commandA0.power = (data[8] & 0xF0) == 0xF0;
+                return {DecodeResultType::Processed, 14};
+
             default:
                 commandRaw.length = 14 - 4 - 1;
                 {
@@ -583,6 +634,28 @@ namespace esphome
             data[8] = !power ? (uint8_t)0xC0 : (uint8_t)0xF0;
             data[8] |= (individual ? 6U : 4U);
             data[9] = (uint8_t)0x21;
+            data[12] = build_checksum(data);
+
+            return data;
+        }
+
+        std::vector<uint8_t> NonNasaRequest::encode_as_cmd50(const std::string &indoor_address)
+        {
+            std::vector<uint8_t> data{
+                0x32,                              // start
+                0x20,                              // src: F3/F4 controller address
+                (uint8_t)hex_to_int(indoor_address), // dst: indoor unit (e.g. 0x84)
+                0x50,                              // cmd
+                0, 0, 0, 0, 0, 0, 0, 0,           // data[4..11]
+                0,                                 // crc
+                0x34                               // end
+            };
+
+            data[4] = encode_request_wind_direction(wind_direction);
+            data[5] = room_temp.temperature;
+            data[6] = (target_temp.temperature & 31U) | encode_request_fanspeed(fanspeed);
+            data[7] = encode_request_mode(mode);
+            data[8] = !power ? (uint8_t)0xC4 : (uint8_t)0xF4;
             data[12] = build_checksum(data);
 
             return data;
@@ -996,6 +1069,71 @@ namespace esphome
                         }
                     }
                 }
+            }
+            else if (nonpacket_.cmd == NonNasaCommand::CmdA0 && nonpacket_.dst == "20")
+            {
+                // F3/F4 wired controller bus: indoor unit polls our controller with its current state.
+                // We update HA with reported state and respond immediately with Cmd50 (desired state).
+                if (!controller_registered)
+                {
+                    controller_registered = true;
+                    LOGD("F3/F4 mode detected, controller active");
+                }
+
+                NonNasaMode nonnasa_mode = encoded_to_nonnasa_mode(nonpacket_.commandA0.mode_encoded);
+
+                NonNasaCommand20 synthetic;
+                synthetic.target_temp = nonpacket_.commandA0.target_temp;
+                synthetic.room_temp = nonpacket_.commandA0.room_temp;
+                synthetic.fanspeed = nonpacket_.commandA0.fanspeed;
+                synthetic.mode = nonnasa_mode;
+                synthetic.power = nonpacket_.commandA0.power;
+                synthetic.wind_direction = nonpacket_.commandA0.wind_direction;
+                last_command20s_[nonpacket_.src] = synthetic;
+
+                bool pending = false;
+                for (auto &item : nonnasa_requests)
+                {
+                    if (item.time_sent > 0 && nonpacket_.src == item.request.dst)
+                    {
+                        pending = true;
+                        break;
+                    }
+                }
+                if (!pending)
+                {
+                    target->set_target_temperature(nonpacket_.src, nonpacket_.commandA0.target_temp.to_celsius());
+                    target->set_room_temperature(nonpacket_.src, nonpacket_.commandA0.room_temp.to_celsius());
+                    target->set_power(nonpacket_.src, nonpacket_.commandA0.power);
+                    target->set_mode(nonpacket_.src, nonnasa_mode_to_mode(nonnasa_mode));
+                    target->set_fanmode(nonpacket_.src, nonnasa_fanspeed_to_fanmode(nonpacket_.commandA0.fanspeed));
+                    target->set_swing_vertical(nonpacket_.src, false);
+                    target->set_swing_horizontal(nonpacket_.src, false);
+                }
+
+                auto req = NonNasaRequest::create(nonpacket_.src);
+                if (!nonnasa_requests.empty())
+                {
+                    auto &item = nonnasa_requests.front();
+                    if (item.time_sent == 0)
+                    {
+                        req = item.request;
+                        item.time_sent = millis();
+                    }
+                }
+                target->publish_data(0, req.encode_as_cmd50(nonpacket_.src));
+            }
+            else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20")
+            {
+                // Our Cmd50 was echoed back or confirmed. Remove matching requests from queue.
+                nonnasa_requests.remove_if([&](const NonNasaRequestQueueItem &item)
+                {
+                    return item.time_sent > 0 &&
+                           nonpacket_.dst == item.request.dst &&
+                           item.request.target_temp.temperature == nonpacket_.commandA0.target_temp.temperature &&
+                           item.request.fanspeed == nonpacket_.commandA0.fanspeed &&
+                           item.request.power == nonpacket_.commandA0.power;
+                });
             }
             else if (nonpacket_.cmd == NonNasaCommand::Cmd54 && nonpacket_.dst == "d0")
             {

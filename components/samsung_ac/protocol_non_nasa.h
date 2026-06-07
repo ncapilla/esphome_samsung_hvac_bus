@@ -159,11 +159,27 @@ namespace esphome
             };
         };
 
+        // F3/F4 wired controller bus: CmdA0 (indoor polls controller) and Cmd50 (controller response).
+        // Data encoding is identical to the F1/F2 B0 command but uses raw Celsius for temperatures.
+        struct NonNasaCommandA0
+        {
+            NonNasaWindDirection wind_direction = NonNasaWindDirection::Stop;
+            Temperature room_temp = { TemperatureUnit::Celsius, 0 };  // raw Celsius
+            Temperature target_temp = { TemperatureUnit::Celsius, 0 }; // raw Celsius
+            NonNasaFanspeed fanspeed = NonNasaFanspeed::Auto;
+            uint8_t mode_encoded = 0;  // 0=auto,1=cool,2=dry,3=fan,4=heat (encode_request_mode values)
+            bool power = false;
+
+            std::string to_string();
+        };
+
         enum class NonNasaCommand : uint8_t
         {
             Cmd20 = 0x20,
+            Cmd50 = 0x50,  // F3/F4: controller → indoor response (desired state)
             Cmd54 = 0x54,
             Cmd8D = 0x8d,
+            CmdA0 = 0xA0,  // F3/F4: indoor → controller poll (current state)
             CmdC0 = 0xc0,
             CmdC1 = 0xc1,
             CmdC6 = 0xc6,
@@ -192,6 +208,7 @@ namespace esphome
                 NonNasaCommandC0 commandC0;
                 NonNasaCommandC1 commandC1;
                 NonNasaCommandC6 commandC6;
+                NonNasaCommandA0 commandA0;  // F3/F4: CmdA0 (poll) and Cmd50 (response)
                 NonNasaCommandF0 commandF0;
                 NonNasaCommandF1 commandF1;
                 NonNasaCommandF3 commandF3;
@@ -215,6 +232,7 @@ namespace esphome
             NonNasaWindDirection wind_direction = NonNasaWindDirection::Stop;
 
             std::vector<uint8_t> encode();
+            std::vector<uint8_t> encode_as_cmd50(const std::string &indoor_address);
             std::string to_string();
 
             static NonNasaRequest create(std::string dst_address);
