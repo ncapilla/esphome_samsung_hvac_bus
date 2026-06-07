@@ -891,6 +891,14 @@ namespace esphome
 
             target->register_address(nonpacket_.src);
 
+            // F3/F4 detection: if we see the WRC (0x84), we're on F3/F4 and don't need the
+            // F1/F2 registration loop. Mark registered immediately to silence it.
+            if (!controller_registered && nonpacket_.src == "84")
+            {
+                controller_registered = true;
+                LOGD("F3/F4 bus detected (src=84) — skipping F1/F2 registration loop");
+            }
+
             // Check if we have a message from the indoor unit. If so, we can assume it is awake.
             if (!indoor_unit_awake && get_address_type(nonpacket_.src) == AddressType::Indoor)
             {
