@@ -1143,6 +1143,13 @@ namespace esphome
                 for (auto &item : nonnasa_requests)
                     if (item.time_sent > 0) { pending = true; break; }
 
+                // Keep last_command20s_ current so create("84") uses correct state as base for HA commands
+                auto &last52 = last_command20s_["84"];
+                last52.power = power;
+                last52.target_temp = { TemperatureUnit::Celsius, (uint8_t)((d[0] & 0x3f) + 9) };
+                last52.room_temp   = { TemperatureUnit::Celsius, (uint8_t)((d[1] & 0x3f) + 9) };
+                last52.fanspeed    = fanspeed;
+
                 if (!pending)
                 {
                     target->set_power("84", power);
@@ -1158,6 +1165,8 @@ namespace esphome
                 // F3/F4: indoor mode status response — mode in DATA8 bits[2:0].
                 // Encoding: 0=auto, 1=cool, 2=dry, 3=fan, 4=heat (same as CmdA0 mode_encoded).
                 NonNasaMode mode = encoded_to_nonnasa_mode(nonpacket_.commandRaw.data[7] & 0x07);
+
+                last_command20s_["84"].mode = mode;
 
                 bool pending = false;
                 for (auto &item : nonnasa_requests)
@@ -1238,12 +1247,20 @@ namespace esphome
                         {
                             item.time_sent = now;
                         }
-                        LOGD("F3/F4 inject CmdA0 (0x85->0x20): power=%d mode=%d temp=%d fan=%d",
+                        LOGD("F3/F4 inject CmdA0 (0x85->0x20): power=%d mode=%d temp=%d fan=%d send=%d",
                              (int)item.request.power,
                              (int)item.request.mode,
                              (int)item.request.target_temp.temperature,
-                             (int)item.request.fanspeed);
+                             (int)item.request.fanspeed,
+                             (int)item.resend_count + 1);
                         target->publish_data(0, item.request.encode_as_cmd_a0("20"));
+                        item.resend_count++;
+                        // F3/F4 indoor does not reply Cmd50 to 0x85 — fire 3 times for reliability then clear
+                        if (item.resend_count >= 3)
+                        {
+                            LOGD("F3/F4 inject done (3 sends), clearing request");
+                            nonnasa_requests.pop_front();
+                        }
                     }
                 }
             }
