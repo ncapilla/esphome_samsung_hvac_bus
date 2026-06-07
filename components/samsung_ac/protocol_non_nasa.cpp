@@ -1128,6 +1128,44 @@ namespace esphome
                     target->set_swing_horizontal("84", false);
                 }
             }
+            else if (nonpacket_.cmd == NonNasaCommand::Cmd52 && nonpacket_.src == "20" && nonpacket_.dst == "84")
+            {
+                // F3/F4: indoor status response — power, set temp, room temp, fan, swing.
+                // Emitted every ~540ms cycle regardless of user interaction, unlike CmdA0.
+                // Encoding from DannyDeGaspari/Samsung-HVAC-buscontrol ac_status.py.
+                const uint8_t *d = nonpacket_.commandRaw.data;
+                bool power               = (d[4] & 0x80) == 0x80;
+                float settemp            = (float)((d[0] & 0x3f) + 9);
+                float roomtemp           = (float)((d[1] & 0x3f) + 9);
+                NonNasaFanspeed fanspeed = (NonNasaFanspeed)(d[3] & 0x07);
+
+                bool pending = false;
+                for (auto &item : nonnasa_requests)
+                    if (item.time_sent > 0) { pending = true; break; }
+
+                if (!pending)
+                {
+                    target->set_power("84", power);
+                    target->set_target_temperature("84", settemp);
+                    target->set_room_temperature("84", roomtemp);
+                    target->set_fanmode("84", nonnasa_fanspeed_to_fanmode(fanspeed));
+                    target->set_swing_vertical("84", false);
+                    target->set_swing_horizontal("84", false);
+                }
+            }
+            else if (nonpacket_.cmd == NonNasaCommand::Cmd53 && nonpacket_.src == "20" && nonpacket_.dst == "84")
+            {
+                // F3/F4: indoor mode status response — mode in DATA8 bits[2:0].
+                // Encoding: 0=auto, 1=cool, 2=dry, 3=fan, 4=heat (same as CmdA0 mode_encoded).
+                NonNasaMode mode = encoded_to_nonnasa_mode(nonpacket_.commandRaw.data[7] & 0x07);
+
+                bool pending = false;
+                for (auto &item : nonnasa_requests)
+                    if (item.time_sent > 0) { pending = true; break; }
+
+                if (!pending)
+                    target->set_mode("84", nonnasa_mode_to_mode(mode));
+            }
             else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "85")
             {
                 // Indoor (0x20) responded to our CmdA0 injection — clear the sent request.

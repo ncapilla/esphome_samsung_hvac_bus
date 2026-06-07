@@ -177,6 +177,8 @@ namespace esphome
         {
             Cmd20 = 0x20,
             Cmd50 = 0x50,  // F3/F4: controller → indoor response (desired state)
+            Cmd52 = 0x52,  // F3/F4: indoor → WRC status (power, settemp, roomtemp, fan, swing)
+            Cmd53 = 0x53,  // F3/F4: indoor → WRC status (mode)
             Cmd54 = 0x54,
             Cmd8D = 0x8d,
             CmdA0 = 0xA0,  // F3/F4: indoor → controller poll (current state)
