@@ -232,7 +232,8 @@ namespace esphome
             NonNasaWindDirection wind_direction = NonNasaWindDirection::Stop;
 
             std::vector<uint8_t> encode();
-            std::vector<uint8_t> encode_as_cmd50(const std::string &indoor_address);
+            // F3/F4 secondary master: send CmdA0 to indoor during 300ms gap after 0xAD broadcast
+            std::vector<uint8_t> encode_as_cmd_a0(const std::string &indoor_address);
             std::string to_string();
 
             static NonNasaRequest create(std::string dst_address);

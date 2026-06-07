@@ -25,6 +25,12 @@ namespace esphome
         static bool pending_control_tx_ = false;
         static uint32_t pending_control_tx_due_ms_ = 0;
 
+        // F3/F4 secondary master injection scheduling (during 300ms gap after 0xAD broadcast)
+        static bool pending_f3f4_tx_ = false;
+        static uint32_t pending_f3f4_tx_due_ms_ = 0;
+        // Inject 50ms after 0xAD to let bus settle; well within the ~300ms gap
+        constexpr uint32_t F3F4_INJECT_DELAY_MS = 50;
+
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
         // cumulative energy across device restarts. The tracker is keyed by device address, so if
@@ -639,20 +645,23 @@ namespace esphome
             return data;
         }
 
-        std::vector<uint8_t> NonNasaRequest::encode_as_cmd50(const std::string &indoor_address)
+        std::vector<uint8_t> NonNasaRequest::encode_as_cmd_a0(const std::string &indoor_address)
         {
+            // Send CmdA0 as secondary master (0x85) to indoor unit on F3/F4 bus.
+            // 0x85 is a second controller address distinct from the physical WRC (0x84).
+            // data[5] is always 0x18 — a fixed constant in this protocol, not room temperature.
             std::vector<uint8_t> data{
-                0x32,                              // start
-                0x20,                              // src: F3/F4 controller address
-                (uint8_t)hex_to_int(indoor_address), // dst: indoor unit (e.g. 0x84)
-                0x50,                              // cmd
-                0, 0, 0, 0, 0, 0, 0, 0,           // data[4..11]
-                0,                                 // crc
-                0x34                               // end
+                0x32,                                // start
+                0x85,                                // src: secondary master address
+                (uint8_t)hex_to_int(indoor_address), // dst: indoor unit (0x20)
+                0xA0,                                // cmd: CmdA0 (change settings)
+                0, 0, 0, 0, 0, 0, 0, 0,             // data[4..11]
+                0,                                   // crc
+                0x34                                 // end
             };
 
             data[4] = encode_request_wind_direction(wind_direction);
-            data[5] = room_temp.temperature;
+            data[5] = 0x18; // constant per protocol; room temp is NOT sent in CmdA0
             data[6] = (target_temp.temperature & 31U) | encode_request_fanspeed(fanspeed);
             data[7] = encode_request_mode(mode);
             data[8] = !power ? (uint8_t)0xC4 : (uint8_t)0xF4;
@@ -1070,31 +1079,32 @@ namespace esphome
                     }
                 }
             }
-            else if (nonpacket_.cmd == NonNasaCommand::CmdA0 && nonpacket_.dst == "20")
+            else if (nonpacket_.cmd == NonNasaCommand::CmdA0 && nonpacket_.src == "84" && nonpacket_.dst == "20")
             {
-                // F3/F4 wired controller bus: indoor unit polls our controller with its current state.
-                // We update HA with reported state and respond immediately with Cmd50 (desired state).
+                // F3/F4: WRC (0x84) polls indoor (0x20) with current desired settings.
+                // We passively read this to track HA state — we do NOT respond (no bus collision).
+                // Control is injected separately as secondary master during the 0xAD gap.
                 if (!controller_registered)
                 {
                     controller_registered = true;
-                    LOGD("F3/F4 mode detected, controller active");
+                    LOGD("F3/F4 bus detected (WRC=84, indoor=20) — passive monitoring active");
                 }
 
                 NonNasaMode nonnasa_mode = encoded_to_nonnasa_mode(nonpacket_.commandA0.mode_encoded);
 
                 NonNasaCommand20 synthetic;
                 synthetic.target_temp = nonpacket_.commandA0.target_temp;
-                synthetic.room_temp = nonpacket_.commandA0.room_temp;
                 synthetic.fanspeed = nonpacket_.commandA0.fanspeed;
                 synthetic.mode = nonnasa_mode;
                 synthetic.power = nonpacket_.commandA0.power;
                 synthetic.wind_direction = nonpacket_.commandA0.wind_direction;
-                last_command20s_[nonpacket_.src] = synthetic;
+                // State is keyed on "84" (WRC) which is the registered HA device address
+                last_command20s_["84"] = synthetic;
 
                 bool pending = false;
                 for (auto &item : nonnasa_requests)
                 {
-                    if (item.time_sent > 0 && nonpacket_.src == item.request.dst)
+                    if (item.time_sent > 0)
                     {
                         pending = true;
                         break;
@@ -1102,37 +1112,21 @@ namespace esphome
                 }
                 if (!pending)
                 {
-                    target->set_target_temperature(nonpacket_.src, nonpacket_.commandA0.target_temp.to_celsius());
-                    target->set_room_temperature(nonpacket_.src, nonpacket_.commandA0.room_temp.to_celsius());
-                    target->set_power(nonpacket_.src, nonpacket_.commandA0.power);
-                    target->set_mode(nonpacket_.src, nonnasa_mode_to_mode(nonnasa_mode));
-                    target->set_fanmode(nonpacket_.src, nonnasa_fanspeed_to_fanmode(nonpacket_.commandA0.fanspeed));
-                    target->set_swing_vertical(nonpacket_.src, false);
-                    target->set_swing_horizontal(nonpacket_.src, false);
+                    target->set_target_temperature("84", nonpacket_.commandA0.target_temp.to_celsius());
+                    target->set_power("84", nonpacket_.commandA0.power);
+                    target->set_mode("84", nonnasa_mode_to_mode(nonnasa_mode));
+                    target->set_fanmode("84", nonnasa_fanspeed_to_fanmode(nonpacket_.commandA0.fanspeed));
+                    target->set_swing_vertical("84", false);
+                    target->set_swing_horizontal("84", false);
                 }
-
-                auto req = NonNasaRequest::create(nonpacket_.src);
-                if (!nonnasa_requests.empty())
-                {
-                    auto &item = nonnasa_requests.front();
-                    if (item.time_sent == 0)
-                    {
-                        req = item.request;
-                        item.time_sent = millis();
-                    }
-                }
-                target->publish_data(0, req.encode_as_cmd50(nonpacket_.src));
             }
-            else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20")
+            else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "85")
             {
-                // Our Cmd50 was echoed back or confirmed. Remove matching requests from queue.
+                // Indoor (0x20) responded to our CmdA0 injection — clear the sent request.
+                LOGD("F3/F4 inject confirmed by indoor (Cmd50 from 20 to 85)");
                 nonnasa_requests.remove_if([&](const NonNasaRequestQueueItem &item)
                 {
-                    return item.time_sent > 0 &&
-                           nonpacket_.dst == item.request.dst &&
-                           item.request.target_temp.temperature == nonpacket_.commandA0.target_temp.temperature &&
-                           item.request.fanspeed == nonpacket_.commandA0.fanspeed &&
-                           item.request.power == nonpacket_.commandA0.power;
+                    return item.time_sent > 0;
                 });
             }
             else if (nonpacket_.cmd == NonNasaCommand::Cmd54 && nonpacket_.dst == "d0")
@@ -1164,10 +1158,50 @@ namespace esphome
                     }
                 }
             }
+            else if (nonpacket_.src == "84" && nonpacket_.dst == "ad")
+            {
+                // F3/F4: WRC (0x84) finished its polling cycle with a broadcast to 0xAD.
+                // A ~300ms gap follows before the next cycle — use it to inject CmdA0 as
+                // secondary master (0x85) if we have a pending HA command.
+                if (!nonnasa_requests.empty())
+                {
+                    LOGD("F3/F4 0xAD gap: scheduling CmdA0 injection in %ums", F3F4_INJECT_DELAY_MS);
+                    const uint32_t now = millis();
+                    if (!pending_f3f4_tx_)
+                    {
+                        pending_f3f4_tx_ = true;
+                        pending_f3f4_tx_due_ms_ = now + F3F4_INJECT_DELAY_MS;
+                    }
+                }
+            }
         }
 
         void NonNasaProtocol::protocol_update(MessageTarget *target)
         {
+            // F3/F4 secondary master injection — fire CmdA0 during the 300ms gap after 0xAD broadcast
+            if (pending_f3f4_tx_)
+            {
+                const uint32_t now = millis();
+                if ((int32_t)(now - pending_f3f4_tx_due_ms_) >= 0)
+                {
+                    pending_f3f4_tx_ = false;
+                    if (!nonnasa_requests.empty())
+                    {
+                        auto &item = nonnasa_requests.front();
+                        if (item.time_sent == 0)
+                        {
+                            item.time_sent = now;
+                        }
+                        LOGD("F3/F4 inject CmdA0 (0x85->0x20): power=%d mode=%d temp=%d fan=%d",
+                             (int)item.request.power,
+                             (int)item.request.mode,
+                             (int)item.request.target_temp.temperature,
+                             (int)item.request.fanspeed);
+                        target->publish_data(0, item.request.encode_as_cmd_a0("20"));
+                    }
+                }
+            }
+
             // non-blocking keepalive send (scheduled from broadcast request)
             if (non_nasa_keepalive && pending_keepalive_)
             {
