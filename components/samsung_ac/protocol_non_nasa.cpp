@@ -558,7 +558,7 @@ namespace esphome
             std::vector<uint8_t> data{
                 0x32,                     // 00 start
                 0xD0,                     // 01 src
-                (uint8_t)hex_to_int(dst), // 02 dst
+                0xC8,                     // 02 dst (outdoor unit relays to indoor)
                 0xB0,                     // 03 cmd
                 0x1F,                     // 04 swing
                 0x04,                     // 05 ?
