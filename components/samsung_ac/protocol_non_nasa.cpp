@@ -647,13 +647,13 @@ namespace esphome
 
         std::vector<uint8_t> NonNasaRequest::encode_as_cmd_a0(const std::string &indoor_address)
         {
-            // Send CmdA0 as WRC address (0x84) during the 0xAD gap.
-            // Using 0x84 (not secondary master 0x85) because this indoor unit only accepts
-            // CmdA0 from its registered WRC address. The real WRC is silent during this gap.
+            // Send CmdA0 as secondary master address (0x85) during the 0xAD gap.
+            // DannyDeGaspari confirms 0x85 works alongside a physical WRC at 0x84.
+            // Earlier 0x85 attempt failed due to temp=0 encoding bug (now fixed).
             // data[5] is always 0x18 — a fixed constant in this protocol, not room temperature.
             std::vector<uint8_t> data{
                 0x32,                                // start
-                0x84,                                // src: WRC address (indoor only accepts from 0x84)
+                0x85,                                // src: secondary master address
                 (uint8_t)hex_to_int(indoor_address), // dst: indoor unit (0x20)
                 0xA0,                                // cmd: CmdA0 (change settings)
                 0, 0, 0, 0, 0, 0, 0, 0,             // data[4..11]
@@ -1248,7 +1248,7 @@ namespace esphome
                         {
                             item.time_sent = now;
                         }
-                        LOGD("F3/F4 inject CmdA0 (0x84->0x20): power=%d mode=%d temp=%d fan=%d send=%d",
+                        LOGD("F3/F4 inject CmdA0 (0x85->0x20): power=%d mode=%d temp=%d fan=%d send=%d",
                              (int)item.request.power,
                              (int)item.request.mode,
                              (int)item.request.target_temp.temperature,
@@ -1256,7 +1256,7 @@ namespace esphome
                              (int)item.resend_count + 1);
                         target->publish_data(0, item.request.encode_as_cmd_a0("20"));
                         item.resend_count++;
-                        // F3/F4 indoor does not reply Cmd50 to 0x85 — fire 3 times for reliability then clear
+                        // Protocol: indoor replies cmd:50 to confirm CmdA0. Fire 3 times for reliability then clear.
                         if (item.resend_count >= 3)
                         {
                             LOGD("F3/F4 inject done (3 sends), clearing request");
