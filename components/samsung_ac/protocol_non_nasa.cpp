@@ -28,10 +28,10 @@ namespace esphome
         // F3/F4 secondary master injection scheduling (during 300ms gap after 0xAD broadcast)
         static bool pending_f3f4_tx_ = false;
         static uint32_t pending_f3f4_tx_due_ms_ = 0;
-        // Natural WRC sends CmdA0 at T+361ms after CmdD1 (the normal query slot).
-        // Inject at T+300ms so ESPHome occupies the bus just before the WRC's T+361ms slot;
-        // the WRC is in RX mode and backs off when it senses the bus active (CSMA).
-        constexpr uint32_t F3F4_INJECT_DELAY_MS = 300;
+        // Danny De Gaspari's reference implementation sends CmdA0 immediately after seeing
+        // the 0xAD broadcast (no extra delay). The ~300ms gap that follows belongs to secondary
+        // masters; the WRC resumes polling after that gap without noticing.
+        constexpr uint32_t F3F4_INJECT_DELAY_MS = 5;
 
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
@@ -649,12 +649,13 @@ namespace esphome
 
         std::vector<uint8_t> NonNasaRequest::encode_as_cmd_a0(const std::string &indoor_address)
         {
-            // CmdA0 must be sent as src=0x84 (the WRC address). Confirmed by log capture:
-            // the indoor unit ignores CmdA0 from any address other than its known WRC (0x84).
+            // Use 0x85 as source — the conventional secondary master address on Samsung NonNASA.
+            // Danny De Gaspari's reference confirms this: the WRC at 0x84 doesn't notice a
+            // secondary master at 0x85 and takes over the changed state on its next status poll.
             // data[5] is the current room temperature in Celsius (confirmed from log18 capture).
             std::vector<uint8_t> data{
                 0x32,                                // start
-                (uint8_t)hex_to_int(dst),            // src: WRC address from YAML config — indoor only accepts CmdA0 from its registered WRC
+                0x85,                                // src: secondary master (0x85) — does not conflict with WRC at 0x84
                 (uint8_t)hex_to_int(indoor_address), // dst: indoor unit (0x20)
                 0xA0,                                // cmd: CmdA0 (change settings)
                 0, 0, 0, 0, 0, 0, 0, 0,             // data[4..11]
@@ -1177,11 +1178,10 @@ namespace esphome
                 if (!pending)
                     target->set_mode("84", nonnasa_mode_to_mode(mode));
             }
-            else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "84")
+            else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "85")
             {
-                // Indoor (0x20) confirmed CmdA0 — clear the sent request.
-                // Sent as src=0x84, so the Cmd50 reply goes back to 0x84.
-                LOGD("F3/F4 inject confirmed by indoor (Cmd50 from 20 to 84)");
+                // Indoor (0x20) confirmed CmdA0 sent by the secondary master at 0x85.
+                LOGD("F3/F4 inject confirmed by indoor (Cmd50 from 20 to 85)");
                 nonnasa_requests.remove_if([&](const NonNasaRequestQueueItem &item)
                 {
                     return item.time_sent > 0;
