@@ -647,13 +647,12 @@ namespace esphome
 
         std::vector<uint8_t> NonNasaRequest::encode_as_cmd_a0(const std::string &indoor_address)
         {
-            // Send CmdA0 as secondary master address (0x85) during the 0xAD gap.
-            // DannyDeGaspari confirms 0x85 works alongside a physical WRC at 0x84.
-            // Earlier 0x85 attempt failed due to temp=0 encoding bug (now fixed).
-            // data[5] is always 0x18 — a fixed constant in this protocol, not room temperature.
+            // CmdA0 must be sent as src=0x84 (the WRC address). Confirmed by log capture:
+            // the indoor unit ignores CmdA0 from any address other than its known WRC (0x84).
+            // data[5] is the current room temperature in Celsius (confirmed from log18 capture).
             std::vector<uint8_t> data{
                 0x32,                                // start
-                0x85,                                // src: secondary master address
+                0x84,                                // src: WRC address — indoor only accepts CmdA0 from 0x84
                 (uint8_t)hex_to_int(indoor_address), // dst: indoor unit (0x20)
                 0xA0,                                // cmd: CmdA0 (change settings)
                 0, 0, 0, 0, 0, 0, 0, 0,             // data[4..11]
@@ -662,7 +661,7 @@ namespace esphome
             };
 
             data[4] = encode_request_wind_direction(wind_direction);
-            data[5] = 0x18; // constant per protocol; room temp is NOT sent in CmdA0
+            data[5] = room_temp.temperature > 0 ? room_temp.temperature : 0x18;
             data[6] = (target_temp.temperature & 31U) | encode_request_fanspeed(fanspeed);
             data[7] = encode_request_mode(mode);
             data[8] = !power ? (uint8_t)0xC4 : (uint8_t)0xF4;
@@ -1176,10 +1175,11 @@ namespace esphome
                 if (!pending)
                     target->set_mode("84", nonnasa_mode_to_mode(mode));
             }
-            else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "85")
+            else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "84")
             {
-                // Indoor (0x20) responded to our CmdA0 injection — clear the sent request.
-                LOGD("F3/F4 inject confirmed by indoor (Cmd50 from 20 to 85)");
+                // Indoor (0x20) confirmed CmdA0 — clear the sent request.
+                // Sent as src=0x84, so the Cmd50 reply goes back to 0x84.
+                LOGD("F3/F4 inject confirmed by indoor (Cmd50 from 20 to 84)");
                 nonnasa_requests.remove_if([&](const NonNasaRequestQueueItem &item)
                 {
                     return item.time_sent > 0;
