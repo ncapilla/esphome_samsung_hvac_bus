@@ -652,7 +652,7 @@ namespace esphome
             // data[5] is the current room temperature in Celsius (confirmed from log18 capture).
             std::vector<uint8_t> data{
                 0x32,                                // start
-                0x84,                                // src: WRC address — indoor only accepts CmdA0 from 0x84
+                (uint8_t)hex_to_int(dst),            // src: WRC address from YAML config — indoor only accepts CmdA0 from its registered WRC
                 (uint8_t)hex_to_int(indoor_address), // dst: indoor unit (0x20)
                 0xA0,                                // cmd: CmdA0 (change settings)
                 0, 0, 0, 0, 0, 0, 0, 0,             // data[4..11]
