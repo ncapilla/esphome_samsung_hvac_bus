@@ -1270,7 +1270,7 @@ namespace esphome
                     };
                     probe[12] = build_checksum(probe);
                     LOGD("F3/F4 Cmd52 TX probe (0x85->0x20): if AC replies dst=85, TX is confirmed");
-                    target->publish_data(0, probe);
+                    target->publish_data(0, std::move(probe));
                 }
             }
 
