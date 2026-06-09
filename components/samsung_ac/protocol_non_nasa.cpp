@@ -25,18 +25,37 @@ namespace esphome
         static bool pending_control_tx_ = false;
         static uint32_t pending_control_tx_due_ms_ = 0;
 
-        // F3/F4 secondary master injection scheduling (during 300ms gap after 0xAD broadcast)
-        static bool pending_f3f4_tx_ = false;
-        static uint32_t pending_f3f4_tx_due_ms_ = 0;
-        // Danny De Gaspari's reference implementation sends CmdA0 immediately after seeing
-        // the 0xAD broadcast (no extra delay). The ~300ms gap that follows belongs to secondary
-        // masters; the WRC resumes polling after that gap without noticing.
-        constexpr uint32_t F3F4_INJECT_DELAY_MS = 0;
+        // =====================================================================================
+        // F3/F4 TX DIAGNOSTIC — rotates 3 cycle types on each CmdD1 to test all hypotheses at once:
+        //   phase 0  CLEAN          : transmit nothing (control; indoor must answer the WRC).
+        //   phase 1  PADDED PROBE   : Cmd52 (src=0x84) + sacrificial padding bytes at +20ms.
+        //   phase 2  COLLISION      : burst of frames at +330ms, on top of the WRC's exchange.
+        //
+        // Hypotheses & reads (see git log / discussion):
+        //   A  TX dead              -> padded probe silent AND collision cycles look like clean.
+        //   B  protocol/timing slot -> padded probe silent BUT collision drops the indoor response.
+        //   C  frame truncation     -> padded probe GETS A REPLY (truncation ate the padding,
+        //                              the real 14-byte frame survived intact). Fix = DE-hold / padding.
+        //
+        // Why padding finds C: at 2400 baud a bit is 417us. If DE releases slightly early the slow
+        // stop/parity bits of the LAST byte get chopped. Appending throwaway bytes after 0x34 means
+        // the chop eats the padding, leaving the real frame valid -> the AC finally answers.
+        static uint8_t cycle_phase_ = 0; // 0=clean, 1=padded probe, 2=collision
 
-        // F3/F4 Cmd52 TX probe — sent unconditionally in the 0xAD gap to confirm ESPHome
-        // can physically transmit. If the AC (0x20) replies with Cmd52 to dst=85, TX is confirmed.
-        static bool pending_f3f4_probe_ = false;
-        static uint32_t pending_f3f4_probe_due_ms_ = 0;
+        // PADDED PROBE
+        static bool pending_probe_ = false;
+        static uint32_t pending_probe_due_ms_ = 0;
+        static uint32_t probe_sent_ms_ = 0;     // when the padded probe left; used to time the reply window
+        static bool watching_probe_reply_ = false;
+        constexpr uint32_t F3F4_PROBE_DELAY_MS = 20;       // fire early in the gap, like prior probes
+        constexpr int F3F4_PROBE_PADDING_BYTES = 6;        // sacrificial bytes appended after 0x34
+        constexpr uint32_t F3F4_PROBE_REPLY_WINDOW_MS = 250; // our reply lands ~+90ms; WRC is silent until ~+358ms
+
+        // COLLISION (fallback A-vs-not-A discriminator)
+        static bool pending_collision_tx_ = false;
+        static uint32_t pending_collision_tx_due_ms_ = 0;
+        constexpr uint32_t F3F4_COLLISION_DELAY_MS = 330;
+        constexpr int F3F4_COLLISION_BURST_FRAMES = 3;
 
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
@@ -1138,6 +1157,21 @@ namespace esphome
             }
             else if (nonpacket_.cmd == NonNasaCommand::Cmd52 && nonpacket_.src == "20" && nonpacket_.dst == "84")
             {
+                // ===== PADDED PROBE reply detection (diagnostic) =====
+                // This frame is also the WRC's normal poll reply (~+430ms after CmdD1). Our probe's
+                // reply lands far earlier (~+90ms), inside the watch window — so a hit here = OUR reply.
+                if (watching_probe_reply_)
+                {
+                    const uint32_t now = millis();
+                    if ((int32_t)(now - (probe_sent_ms_ + F3F4_PROBE_REPLY_WINDOW_MS)) < 0)
+                    {
+                        watching_probe_reply_ = false;
+                        LOGW("F3/F4 *** PADDED PROBE REPLY *** AC answered our 0x84 Cmd52 at +%ums "
+                             "-> TX REACHES BUS and frame valid. Hypothesis C (truncation) CONFIRMED. "
+                             "Fix: DE-hold / frame padding.", (unsigned)(now - probe_sent_ms_));
+                    }
+                }
+
                 // F3/F4: indoor status response — power, set temp, room temp, fan, swing.
                 // Emitted every ~540ms cycle regardless of user interaction, unlike CmdA0.
                 // Encoding from DannyDeGaspari/Samsung-HVAC-buscontrol ac_status.py.
@@ -1224,79 +1258,92 @@ namespace esphome
             else if (nonpacket_.src == "84" && nonpacket_.dst == "ad")
             {
                 // F3/F4: WRC (0x84) finished its polling cycle with a broadcast to 0xAD.
-                // A ~300ms gap follows before the next cycle — use it to inject frames as
-                // secondary master (0x85).
+                //
+                // ===== TX DIAGNOSTIC MODE =====
+                // Normal CmdA0 injection is DISABLED during this test so the log stays clean.
+                // Rotate clean / padded-probe / collision across consecutive cycles.
                 const uint32_t now = millis();
-
-                // Always schedule a Cmd52 TX probe to confirm ESPHome can physically transmit.
-                if (!pending_f3f4_probe_)
+                cycle_phase_ = (cycle_phase_ + 1) % 3;
+                if (cycle_phase_ == 1)
                 {
-                    pending_f3f4_probe_ = true;
-                    pending_f3f4_probe_due_ms_ = now + F3F4_INJECT_DELAY_MS;
-                }
-
-                // Schedule CmdA0 if there is a pending HA command.
-                if (!nonnasa_requests.empty())
-                {
-                    LOGD("F3/F4 0xAD gap: scheduling CmdA0 injection in %ums", F3F4_INJECT_DELAY_MS);
-                    if (!pending_f3f4_tx_)
+                    LOGW("F3/F4 PADDED-PROBE CYCLE: Cmd52(0x84)+%dpad scheduled at +%ums",
+                         F3F4_PROBE_PADDING_BYTES, F3F4_PROBE_DELAY_MS);
+                    if (!pending_probe_)
                     {
-                        pending_f3f4_tx_ = true;
-                        pending_f3f4_tx_due_ms_ = now + F3F4_INJECT_DELAY_MS;
+                        pending_probe_ = true;
+                        pending_probe_due_ms_ = now + F3F4_PROBE_DELAY_MS;
                     }
                 }
+                else if (cycle_phase_ == 2)
+                {
+                    LOGW("F3/F4 COLLISION CYCLE: burst scheduled at +%ums", F3F4_COLLISION_DELAY_MS);
+                    if (!pending_collision_tx_)
+                    {
+                        pending_collision_tx_ = true;
+                        pending_collision_tx_due_ms_ = now + F3F4_COLLISION_DELAY_MS;
+                    }
+                }
+                // phase 0: clean cycle — transmit nothing (in-log control baseline).
             }
         }
 
         void NonNasaProtocol::protocol_update(MessageTarget *target)
         {
-            // F3/F4 Cmd52 TX probe — fires unconditionally to confirm ESPHome TX reaches the bus.
-            // If AC (0x20) replies with Cmd52 addressed to 0x85, TX is confirmed working.
-            if (pending_f3f4_probe_)
+            // F3/F4 PADDED PROBE — Cmd52(src=0x84) with sacrificial padding appended after 0x34.
+            // If the AC replies (src:20;dst:84;cmd:52) within the reply window, the real 14-byte
+            // frame survived intact while the padding absorbed the DE-release truncation -> hypothesis
+            // C confirmed and the production fix is a DE-hold / frame padding.
+            if (pending_probe_)
             {
                 const uint32_t now = millis();
-                if ((int32_t)(now - pending_f3f4_probe_due_ms_) >= 0)
+                if ((int32_t)(now - pending_probe_due_ms_) >= 0)
                 {
-                    pending_f3f4_probe_ = false;
+                    pending_probe_ = false;
                     std::vector<uint8_t> probe{
                         0x32, 0x84, 0x20, 0x52,
                         0, 0, 0, 0, 0, 0, 0, 0,
                         0, 0x34
                     };
-                    probe[12] = build_checksum(probe);
-                    LOGD("F3/F4 Cmd52 TX probe (0x84->0x20): if AC replies in gap window, TX is confirmed");
+                    probe[12] = build_checksum(probe); // checksum over the real 14-byte frame
+                    for (int i = 0; i < F3F4_PROBE_PADDING_BYTES; i++)
+                        probe.push_back(0x00);         // sacrificial tail — truncation eats this, not 0x34
+                    LOGW("F3/F4 PADDED PROBE sent (Cmd52 0x84->0x20 + %d pad). Watching for reply...",
+                         F3F4_PROBE_PADDING_BYTES);
+                    probe_sent_ms_ = now;
+                    watching_probe_reply_ = true;
                     target->publish_data(0, std::move(probe));
                 }
             }
 
-            // F3/F4 secondary master injection — fire CmdA0 during the 300ms gap after 0xAD broadcast
-            if (pending_f3f4_tx_)
+            // Close the probe reply window if no reply arrived in time.
+            if (watching_probe_reply_)
             {
                 const uint32_t now = millis();
-                if ((int32_t)(now - pending_f3f4_tx_due_ms_) >= 0)
+                if ((int32_t)(now - (probe_sent_ms_ + F3F4_PROBE_REPLY_WINDOW_MS)) >= 0)
                 {
-                    pending_f3f4_tx_ = false;
-                    if (!nonnasa_requests.empty())
+                    watching_probe_reply_ = false;
+                    LOGW("F3/F4 PADDED PROBE: no reply in %ums window (frame still rejected or TX dead)",
+                         F3F4_PROBE_REPLY_WINDOW_MS);
+                }
+            }
+
+            // F3/F4 COLLISION burst — back-to-back frames over the WRC's query + indoor reply window.
+            if (pending_collision_tx_)
+            {
+                const uint32_t now = millis();
+                if ((int32_t)(now - pending_collision_tx_due_ms_) >= 0)
+                {
+                    pending_collision_tx_ = false;
+                    LOGW("F3/F4 COLLISION burst: firing %d frames over the WRC exchange", F3F4_COLLISION_BURST_FRAMES);
+                    for (int i = 0; i < F3F4_COLLISION_BURST_FRAMES; i++)
                     {
-                        auto &item = nonnasa_requests.front();
-                        if (item.time_sent == 0)
-                        {
-                            item.time_sent = now;
-                        }
-                        LOGD("F3/F4 inject CmdA0 (0x85->0x20): power=%d mode=%d temp=%d fan=%d send=%d",
-                             (int)item.request.power,
-                             (int)item.request.mode,
-                             (int)item.request.target_temp.temperature,
-                             (int)item.request.fanspeed,
-                             (int)item.resend_count + 1);
-                        target->publish_data(0, item.request.encode_as_cmd_a0("20"));
-                        item.resend_count++;
-                        // Protocol: indoor replies cmd:50 to confirm CmdA0. Fire 3 times for reliability then clear.
-                        if (item.resend_count >= 3)
-                        {
-                            LOGD("F3/F4 inject done (3 sends), clearing request");
-                            nonnasa_requests.pop_front();
-                        }
+                        std::vector<uint8_t> frame{
+                            0x32, 0x84, 0x20, 0x52,
+                            0, 0, 0, 0, 0, 0, 0, 0,
+                            0, 0x34
+                        };
+                        frame[12] = build_checksum(frame);
+                        target->publish_data(0, std::move(frame)); // blocks ~64ms each via flush
                     }
                 }
             }
