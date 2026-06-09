@@ -1183,11 +1183,6 @@ namespace esphome
                 if (!pending)
                     target->set_mode("84", nonnasa_mode_to_mode(mode));
             }
-            else if (nonpacket_.cmd == NonNasaCommand::Cmd52 && nonpacket_.src == "20" && nonpacket_.dst == "85")
-            {
-                // AC replied to our Cmd52 TX probe — this confirms ESPHome TX physically reaches the bus.
-                LOGW("F3/F4 TX CONFIRMED: AC (0x20) replied to Cmd52 probe addressed to 0x85");
-            }
             else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "85")
             {
                 // Indoor (0x20) confirmed CmdA0 sent by the secondary master at 0x85.
@@ -1264,12 +1259,12 @@ namespace esphome
                 {
                     pending_f3f4_probe_ = false;
                     std::vector<uint8_t> probe{
-                        0x32, 0x85, 0x20, 0x52,
+                        0x32, 0x84, 0x20, 0x52,
                         0, 0, 0, 0, 0, 0, 0, 0,
                         0, 0x34
                     };
                     probe[12] = build_checksum(probe);
-                    LOGD("F3/F4 Cmd52 TX probe (0x85->0x20): if AC replies dst=85, TX is confirmed");
+                    LOGD("F3/F4 Cmd52 TX probe (0x84->0x20): if AC replies in gap window, TX is confirmed");
                     target->publish_data(0, std::move(probe));
                 }
             }
