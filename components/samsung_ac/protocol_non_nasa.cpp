@@ -33,6 +33,11 @@ namespace esphome
         // masters; the WRC resumes polling after that gap without noticing.
         constexpr uint32_t F3F4_INJECT_DELAY_MS = 0;
 
+        // F3/F4 Cmd52 TX probe — sent unconditionally in the 0xAD gap to confirm ESPHome
+        // can physically transmit. If the AC (0x20) replies with Cmd52 to dst=85, TX is confirmed.
+        static bool pending_f3f4_probe_ = false;
+        static uint32_t pending_f3f4_probe_due_ms_ = 0;
+
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
         // cumulative energy across device restarts. The tracker is keyed by device address, so if
@@ -1178,6 +1183,11 @@ namespace esphome
                 if (!pending)
                     target->set_mode("84", nonnasa_mode_to_mode(mode));
             }
+            else if (nonpacket_.cmd == NonNasaCommand::Cmd52 && nonpacket_.src == "20" && nonpacket_.dst == "85")
+            {
+                // AC replied to our Cmd52 TX probe — this confirms ESPHome TX physically reaches the bus.
+                LOGW("F3/F4 TX CONFIRMED: AC (0x20) replied to Cmd52 probe addressed to 0x85");
+            }
             else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "85")
             {
                 // Indoor (0x20) confirmed CmdA0 sent by the secondary master at 0x85.
@@ -1219,12 +1229,21 @@ namespace esphome
             else if (nonpacket_.src == "84" && nonpacket_.dst == "ad")
             {
                 // F3/F4: WRC (0x84) finished its polling cycle with a broadcast to 0xAD.
-                // A ~300ms gap follows before the next cycle — use it to inject CmdA0 as
-                // secondary master (0x85) if we have a pending HA command.
+                // A ~300ms gap follows before the next cycle — use it to inject frames as
+                // secondary master (0x85).
+                const uint32_t now = millis();
+
+                // Always schedule a Cmd52 TX probe to confirm ESPHome can physically transmit.
+                if (!pending_f3f4_probe_)
+                {
+                    pending_f3f4_probe_ = true;
+                    pending_f3f4_probe_due_ms_ = now + F3F4_INJECT_DELAY_MS;
+                }
+
+                // Schedule CmdA0 if there is a pending HA command.
                 if (!nonnasa_requests.empty())
                 {
                     LOGD("F3/F4 0xAD gap: scheduling CmdA0 injection in %ums", F3F4_INJECT_DELAY_MS);
-                    const uint32_t now = millis();
                     if (!pending_f3f4_tx_)
                     {
                         pending_f3f4_tx_ = true;
@@ -1236,6 +1255,25 @@ namespace esphome
 
         void NonNasaProtocol::protocol_update(MessageTarget *target)
         {
+            // F3/F4 Cmd52 TX probe — fires unconditionally to confirm ESPHome TX reaches the bus.
+            // If AC (0x20) replies with Cmd52 addressed to 0x85, TX is confirmed working.
+            if (pending_f3f4_probe_)
+            {
+                const uint32_t now = millis();
+                if ((int32_t)(now - pending_f3f4_probe_due_ms_) >= 0)
+                {
+                    pending_f3f4_probe_ = false;
+                    std::vector<uint8_t> probe{
+                        0x32, 0x85, 0x20, 0x52,
+                        0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0x34
+                    };
+                    probe[12] = build_checksum(probe);
+                    LOGD("F3/F4 Cmd52 TX probe (0x85->0x20): if AC replies dst=85, TX is confirmed");
+                    target->publish_data(0, probe);
+                }
+            }
+
             // F3/F4 secondary master injection — fire CmdA0 during the 300ms gap after 0xAD broadcast
             if (pending_f3f4_tx_)
             {
