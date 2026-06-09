@@ -28,8 +28,10 @@ namespace esphome
         // F3/F4 secondary master injection scheduling (during 300ms gap after 0xAD broadcast)
         static bool pending_f3f4_tx_ = false;
         static uint32_t pending_f3f4_tx_due_ms_ = 0;
-        // Inject 50ms after 0xAD to let bus settle; well within the ~300ms gap
-        constexpr uint32_t F3F4_INJECT_DELAY_MS = 50;
+        // Natural WRC sends CmdA0 at T+361ms after CmdD1 (the normal query slot).
+        // Inject at T+300ms so ESPHome occupies the bus just before the WRC's T+361ms slot;
+        // the WRC is in RX mode and backs off when it senses the bus active (CSMA).
+        constexpr uint32_t F3F4_INJECT_DELAY_MS = 300;
 
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
