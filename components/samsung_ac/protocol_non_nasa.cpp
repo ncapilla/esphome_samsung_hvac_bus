@@ -26,44 +26,33 @@ namespace esphome
         static uint32_t pending_control_tx_due_ms_ = 0;
 
         // =====================================================================================
-        // F3/F4 TX DIAGNOSTIC — rotates 3 cycle types on each CmdD1 to test all hypotheses at once:
-        //   phase 0  CLEAN          : transmit nothing (control; indoor must answer the WRC).
-        //   phase 1  PADDED PROBE   : Cmd52 (src=0x84) + sacrificial padding bytes at +20ms.
-        //   phase 2  COLLISION      : ~100-byte continuous blast at +20ms, running through the WRC's
-        //                             query (~+360ms). Collision every 3rd cycle holds block-duty ~28%.
+        // F3/F4 TX DIAGNOSTIC — alternates 2 cycle types on each CmdD1:
+        //   phase 0  CLEAN         : transmit nothing (control; indoor answers the WRC at +360ms).
+        //   phase 1  PADDED PROBE  : Cmd52(0x84) wrapped in sacrificial 0x00 bytes (front AND back),
+        //                            fired at +20ms in the gap.
         //
-        // Hypotheses & reads (see git log / discussion):
-        //   A  TX dead              -> padded probe silent AND collision cycles look like clean.
-        //   B  protocol/timing slot -> padded probe silent BUT collision drops the indoor response.
-        //   C  frame truncation     -> padded probe GETS A REPLY (truncation ate the padding,
-        //                              the real 14-byte frame survived intact). Fix = DE-hold / padding.
+        // Already settled by prior flashes: TX reaches the bus (A rejected — a 100-byte blast deferred
+        // the WRC's query and left no buffered query at unblock); flow_control_pin/GPIO23 not needed;
+        // C-tail rejected (back-padding alone got no reply).
         //
-        // Why padding finds C: at 2400 baud a bit is 417us. If DE releases slightly early the slow
-        // stop/parity bits of the LAST byte get chopped. Appending throwaway bytes after 0x34 means
-        // the chop eats the padding, leaving the real frame valid -> the AC finally answers.
-        static uint8_t cycle_phase_ = 0; // 0=clean, 1=padded probe, 2=collision
+        // This flash discriminates the last two:
+        //   C-head (truncation)  -> probe GETS A REPLY: front-pad absorbs the late-DE clip of the real
+        //                           0x32 start byte, so the AC finally syncs to a valid frame.
+        //                           Fix = pad CmdA0 front+back in production.
+        //   B (protocol/slot)    -> probe SILENT: frame reaches the AC intact (head+tail padded, middle
+        //                           proven clean by the blast, parity/baud proven by working RX) but is
+        //                           ignored because it's out of the WRC's poll slot. No framing left.
+        static bool cycle_probe_ = false; // toggled each CmdD1: false=clean, true=padded probe
 
         // PADDED PROBE
         static bool pending_probe_ = false;
         static uint32_t pending_probe_due_ms_ = 0;
         static uint32_t probe_sent_ms_ = 0;     // when the padded probe left; used to time the reply window
         static bool watching_probe_reply_ = false;
-        constexpr uint32_t F3F4_PROBE_DELAY_MS = 20;       // fire early in the gap, like prior probes
-        constexpr int F3F4_PROBE_PADDING_BYTES = 6;        // sacrificial bytes appended after 0x34
-        constexpr uint32_t F3F4_PROBE_REPLY_WINDOW_MS = 250; // our reply lands ~+90ms; WRC is silent until ~+358ms
-
-        // COLLISION — the decisive A-vs-not-A (TX-reaches-bus) discriminator.
-        // protocol_update only fires reliably right after an RX, not mid-gap, so a +330ms schedule
-        // landed late (~+450ms) AFTER the WRC's query and missed it. Instead we fire at +20ms (which
-        // IS reliable, right after CmdD1) as ONE continuous ~100-byte blast (~458ms at 2400 8E1) that
-        // runs straight through the WRC's query (~+360ms) and the indoor's reply (~+430ms).
-        //   - TX works  -> blast corrupts the query / receiver is off -> WRC<->indoor exchange ABSENT.
-        //   - TX dead   -> driver never enables, receiver stays on -> exchange arrives (late, buffered)
-        //                  but PRESENT. Read present-vs-absent, NOT timestamps.
-        static bool pending_collision_tx_ = false;
-        static uint32_t pending_collision_tx_due_ms_ = 0;
-        constexpr uint32_t F3F4_COLLISION_DELAY_MS = 20;     // reliable: fires right after CmdD1
-        constexpr int F3F4_COLLISION_BLAST_BYTES = 100;      // ~458ms continuous TX; under the 128B FIFO
+        constexpr uint32_t F3F4_PROBE_DELAY_MS = 20;        // fire early in the gap
+        constexpr int F3F4_PROBE_PREFIX_BYTES = 4;          // sacrificial 0x00 BEFORE 0x32 (absorbs late-DE head clip)
+        constexpr int F3F4_PROBE_SUFFIX_BYTES = 6;          // sacrificial 0x00 AFTER 0x34 (absorbs early-DE tail clip)
+        constexpr uint32_t F3F4_PROBE_REPLY_WINDOW_MS = 250; // our reply lands ~+90ms; WRC is silent until ~+360ms
 
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
@@ -1174,9 +1163,9 @@ namespace esphome
                     if ((int32_t)(now - (probe_sent_ms_ + F3F4_PROBE_REPLY_WINDOW_MS)) < 0)
                     {
                         watching_probe_reply_ = false;
-                        LOGW("F3/F4 *** PADDED PROBE REPLY *** AC answered our 0x84 Cmd52 at +%ums "
-                             "-> TX REACHES BUS and frame valid. Hypothesis C (truncation) CONFIRMED. "
-                             "Fix: DE-hold / frame padding.", (unsigned)(now - probe_sent_ms_));
+                        LOGW("F3/F4 *** PADDED PROBE REPLY *** AC answered our wrapped 0x84 Cmd52 at +%ums "
+                             "-> TRUNCATION CONFIRMED (padding made the frame valid). "
+                             "Fix: pad CmdA0 front+back.", (unsigned)(now - probe_sent_ms_));
                     }
                 }
 
@@ -1269,54 +1258,51 @@ namespace esphome
                 //
                 // ===== TX DIAGNOSTIC MODE =====
                 // Normal CmdA0 injection is DISABLED during this test so the log stays clean.
-                // Rotate clean / padded-probe / collision across consecutive cycles.
+                // Alternate clean / padded-probe cycles.
                 const uint32_t now = millis();
-                cycle_phase_ = (cycle_phase_ + 1) % 3;
-                if (cycle_phase_ == 1)
+                cycle_probe_ = !cycle_probe_;
+                if (cycle_probe_)
                 {
-                    LOGW("F3/F4 PADDED-PROBE CYCLE: Cmd52(0x84)+%dpad scheduled at +%ums",
-                         F3F4_PROBE_PADDING_BYTES, F3F4_PROBE_DELAY_MS);
+                    LOGW("F3/F4 PADDED-PROBE CYCLE: %dpre+Cmd52(0x84)+%dpost scheduled at +%ums",
+                         F3F4_PROBE_PREFIX_BYTES, F3F4_PROBE_SUFFIX_BYTES, F3F4_PROBE_DELAY_MS);
                     if (!pending_probe_)
                     {
                         pending_probe_ = true;
                         pending_probe_due_ms_ = now + F3F4_PROBE_DELAY_MS;
                     }
                 }
-                else if (cycle_phase_ == 2)
-                {
-                    LOGW("F3/F4 COLLISION CYCLE: burst scheduled at +%ums", F3F4_COLLISION_DELAY_MS);
-                    if (!pending_collision_tx_)
-                    {
-                        pending_collision_tx_ = true;
-                        pending_collision_tx_due_ms_ = now + F3F4_COLLISION_DELAY_MS;
-                    }
-                }
-                // phase 0: clean cycle — transmit nothing (in-log control baseline).
+                // else: clean cycle — transmit nothing (in-log control baseline).
             }
         }
 
         void NonNasaProtocol::protocol_update(MessageTarget *target)
         {
-            // F3/F4 PADDED PROBE — Cmd52(src=0x84) with sacrificial padding appended after 0x34.
-            // If the AC replies (src:20;dst:84;cmd:52) within the reply window, the real 14-byte
-            // frame survived intact while the padding absorbed the DE-release truncation -> hypothesis
-            // C confirmed and the production fix is a DE-hold / frame padding.
+            // F3/F4 PADDED PROBE — Cmd52(src=0x84) wrapped in sacrificial 0x00 bytes front AND back.
+            // Front pad absorbs a late-DE clip of the real 0x32 start byte (C-head); back pad absorbs
+            // an early-DE clip of the 0x34 end byte (C-tail). If the AC replies within the window, the
+            // real 14-byte frame reached it intact -> truncation was the cause -> fix is to pad CmdA0.
             if (pending_probe_)
             {
                 const uint32_t now = millis();
                 if ((int32_t)(now - pending_probe_due_ms_) >= 0)
                 {
                     pending_probe_ = false;
-                    std::vector<uint8_t> probe{
+                    // Build the real 14-byte frame first so the checksum is over bytes [1..11].
+                    std::vector<uint8_t> frame{
                         0x32, 0x84, 0x20, 0x52,
                         0, 0, 0, 0, 0, 0, 0, 0,
                         0, 0x34
                     };
-                    probe[12] = build_checksum(probe); // checksum over the real 14-byte frame
-                    for (int i = 0; i < F3F4_PROBE_PADDING_BYTES; i++)
-                        probe.push_back(0x00);         // sacrificial tail — truncation eats this, not 0x34
-                    LOGW("F3/F4 PADDED PROBE sent (Cmd52 0x84->0x20 + %d pad). Watching for reply...",
-                         F3F4_PROBE_PADDING_BYTES);
+                    frame[12] = build_checksum(frame);
+                    // Wrap: [prefix 0x00...] + frame + [suffix 0x00...]
+                    std::vector<uint8_t> probe;
+                    for (int i = 0; i < F3F4_PROBE_PREFIX_BYTES; i++)
+                        probe.push_back(0x00);
+                    probe.insert(probe.end(), frame.begin(), frame.end());
+                    for (int i = 0; i < F3F4_PROBE_SUFFIX_BYTES; i++)
+                        probe.push_back(0x00);
+                    LOGW("F3/F4 PADDED PROBE sent (%dpre + Cmd52 0x84->0x20 + %dpost). Watching for reply...",
+                         F3F4_PROBE_PREFIX_BYTES, F3F4_PROBE_SUFFIX_BYTES);
                     probe_sent_ms_ = now;
                     watching_probe_reply_ = true;
                     target->publish_data(0, std::move(probe));
@@ -1330,24 +1316,8 @@ namespace esphome
                 if ((int32_t)(now - (probe_sent_ms_ + F3F4_PROBE_REPLY_WINDOW_MS)) >= 0)
                 {
                     watching_probe_reply_ = false;
-                    LOGW("F3/F4 PADDED PROBE: no reply in %ums window (frame still rejected or TX dead)",
+                    LOGW("F3/F4 PADDED PROBE: no reply in %ums window -> frame reaches AC but is IGNORED (protocol/slot)",
                          F3F4_PROBE_REPLY_WINDOW_MS);
-                }
-            }
-
-            // F3/F4 COLLISION burst — back-to-back frames over the WRC's query + indoor reply window.
-            if (pending_collision_tx_)
-            {
-                const uint32_t now = millis();
-                if ((int32_t)(now - pending_collision_tx_due_ms_) >= 0)
-                {
-                    pending_collision_tx_ = false;
-                    LOGW("F3/F4 COLLISION blast: %d-byte continuous TX over the WRC query window (+~360ms)",
-                         F3F4_COLLISION_BLAST_BYTES);
-                    // One continuous stream (no inter-frame DE-release gaps) so it can't fall between
-                    // the WRC's bytes. 0x55 = max bit transitions. Content is irrelevant — we want noise.
-                    std::vector<uint8_t> blast(F3F4_COLLISION_BLAST_BYTES, 0x55);
-                    target->publish_data(0, std::move(blast)); // blocks ~458ms via flush
                 }
             }
 
