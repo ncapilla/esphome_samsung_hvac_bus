@@ -31,7 +31,7 @@ namespace esphome
         // Danny De Gaspari's reference implementation sends CmdA0 immediately after seeing
         // the 0xAD broadcast (no extra delay). The ~300ms gap that follows belongs to secondary
         // masters; the WRC resumes polling after that gap without noticing.
-        constexpr uint32_t F3F4_INJECT_DELAY_MS = 5;
+        constexpr uint32_t F3F4_INJECT_DELAY_MS = 0;
 
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
