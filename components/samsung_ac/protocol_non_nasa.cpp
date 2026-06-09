@@ -29,7 +29,8 @@ namespace esphome
         // F3/F4 TX DIAGNOSTIC — rotates 3 cycle types on each CmdD1 to test all hypotheses at once:
         //   phase 0  CLEAN          : transmit nothing (control; indoor must answer the WRC).
         //   phase 1  PADDED PROBE   : Cmd52 (src=0x84) + sacrificial padding bytes at +20ms.
-        //   phase 2  COLLISION      : burst of frames at +330ms, on top of the WRC's exchange.
+        //   phase 2  COLLISION      : ~100-byte continuous blast at +20ms, running through the WRC's
+        //                             query (~+360ms). Collision every 3rd cycle holds block-duty ~28%.
         //
         // Hypotheses & reads (see git log / discussion):
         //   A  TX dead              -> padded probe silent AND collision cycles look like clean.
@@ -51,11 +52,18 @@ namespace esphome
         constexpr int F3F4_PROBE_PADDING_BYTES = 6;        // sacrificial bytes appended after 0x34
         constexpr uint32_t F3F4_PROBE_REPLY_WINDOW_MS = 250; // our reply lands ~+90ms; WRC is silent until ~+358ms
 
-        // COLLISION (fallback A-vs-not-A discriminator)
+        // COLLISION — the decisive A-vs-not-A (TX-reaches-bus) discriminator.
+        // protocol_update only fires reliably right after an RX, not mid-gap, so a +330ms schedule
+        // landed late (~+450ms) AFTER the WRC's query and missed it. Instead we fire at +20ms (which
+        // IS reliable, right after CmdD1) as ONE continuous ~100-byte blast (~458ms at 2400 8E1) that
+        // runs straight through the WRC's query (~+360ms) and the indoor's reply (~+430ms).
+        //   - TX works  -> blast corrupts the query / receiver is off -> WRC<->indoor exchange ABSENT.
+        //   - TX dead   -> driver never enables, receiver stays on -> exchange arrives (late, buffered)
+        //                  but PRESENT. Read present-vs-absent, NOT timestamps.
         static bool pending_collision_tx_ = false;
         static uint32_t pending_collision_tx_due_ms_ = 0;
-        constexpr uint32_t F3F4_COLLISION_DELAY_MS = 330;
-        constexpr int F3F4_COLLISION_BURST_FRAMES = 3;
+        constexpr uint32_t F3F4_COLLISION_DELAY_MS = 20;     // reliable: fires right after CmdD1
+        constexpr int F3F4_COLLISION_BLAST_BYTES = 100;      // ~458ms continuous TX; under the 128B FIFO
 
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
@@ -1334,17 +1342,12 @@ namespace esphome
                 if ((int32_t)(now - pending_collision_tx_due_ms_) >= 0)
                 {
                     pending_collision_tx_ = false;
-                    LOGW("F3/F4 COLLISION burst: firing %d frames over the WRC exchange", F3F4_COLLISION_BURST_FRAMES);
-                    for (int i = 0; i < F3F4_COLLISION_BURST_FRAMES; i++)
-                    {
-                        std::vector<uint8_t> frame{
-                            0x32, 0x84, 0x20, 0x52,
-                            0, 0, 0, 0, 0, 0, 0, 0,
-                            0, 0x34
-                        };
-                        frame[12] = build_checksum(frame);
-                        target->publish_data(0, std::move(frame)); // blocks ~64ms each via flush
-                    }
+                    LOGW("F3/F4 COLLISION blast: %d-byte continuous TX over the WRC query window (+~360ms)",
+                         F3F4_COLLISION_BLAST_BYTES);
+                    // One continuous stream (no inter-frame DE-release gaps) so it can't fall between
+                    // the WRC's bytes. 0x55 = max bit transitions. Content is irrelevant — we want noise.
+                    std::vector<uint8_t> blast(F3F4_COLLISION_BLAST_BYTES, 0x55);
+                    target->publish_data(0, std::move(blast)); // blocks ~458ms via flush
                 }
             }
 
