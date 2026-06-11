@@ -859,6 +859,18 @@ namespace esphome
 
         // F3/F4: send queued HA commands as the Main wired remote — CmdA0 from 0x84 -> indoor 0x20.
         // (encode_as_cmd_a0 hardcodes src 0x84; "20" is this unit's indoor address.)
+        //
+        // Anti-truncation padding: DannyDeGaspari's working rig sends the bare 14-byte frame from a
+        // USB-RS485 adapter (clean auto-direction). Our M5Stack SP3485EE auto-direction likely asserts
+        // DE a hair late and clips the leading 0x32 start byte, so the indoor — which only parses frames
+        // beginning with 0x32 — silently drops our A0 (matches: valid frame injected in the same post-AD
+        // gap Danny uses, zero Cmd50 reply). Wrap the (CRC-correct) frame in sacrificial 0x00 bytes in a
+        // SINGLE publish_data call (one DE assertion): the front pad absorbs a late-DE head clip, the back
+        // pad an early-DE tail clip. The 0x00s are inter-frame idle the receiver ignores; the real frame
+        // inside is byte-identical to the WRC's. Front pad is the variable under test (back-pad-alone was
+        // already ruled out in earlier probing).
+        static constexpr int A0_PAD_FRONT = 4; // sacrificial 0x00 before 0x32 (absorbs late-DE head clip)
+        static constexpr int A0_PAD_BACK = 6;  // sacrificial 0x00 after 0x34 (absorbs early-DE tail clip)
         void send_requests_as_a0(MessageTarget *target)
         {
             const uint32_t now = millis();
@@ -867,8 +879,15 @@ namespace esphome
                 if (item.time_sent == 0)
                 {
                     item.time_sent = now;
-                    LOGW("F3/F4 INJECT: CmdA0 0x84->0x20 (impersonating Main WRC). Watch for indoor Cmd50 reply.");
-                    target->publish_data(0, item.request.encode_as_cmd_a0("20"));
+                    auto frame = item.request.encode_as_cmd_a0("20");
+                    std::vector<uint8_t> padded;
+                    padded.reserve(A0_PAD_FRONT + frame.size() + A0_PAD_BACK);
+                    padded.insert(padded.end(), A0_PAD_FRONT, 0x00);
+                    padded.insert(padded.end(), frame.begin(), frame.end());
+                    padded.insert(padded.end(), A0_PAD_BACK, 0x00);
+                    LOGW("F3/F4 INJECT: CmdA0 0x84->0x20 (%dpre+frame+%dpost, anti-truncation). Watch for indoor Cmd50.",
+                         A0_PAD_FRONT, A0_PAD_BACK);
+                    target->publish_data(0, std::move(padded));
                 }
             }
         }
