@@ -46,6 +46,14 @@ namespace esphome
         static uint32_t poll_sent_ms_ = 0;
         constexpr uint32_t POLL_REPLY_WINDOW_MS = 300;
 
+        // F3/F4 DIAGNOSTIC timing sweep: each successive injection (initial + the 3 resends) uses the
+        // next delay here, so ONE flash tests several post-0xAD timings. Tests the "unit wants more
+        // silence after 0xAD before it accepts a frame" lead (the WRC waits ~360ms; +20ms was ignored).
+        // Kept <= 200 so the padded poll (~110ms TX) finishes before the WRC's next poll (~+360ms).
+        static const uint16_t F3F4_DELAY_SWEEP[] = {50, 100, 150, 200};
+        static constexpr size_t F3F4_DELAY_SWEEP_N = 4;
+        static size_t f3f4_sweep_idx = 0;
+
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
         // cumulative energy across device restarts. The tracker is keyed by device address, so if
@@ -1312,9 +1320,14 @@ namespace esphome
                 if (queued && !pending_a0_tx_)
                 {
                     const uint32_t now = millis();
+                    // DIAGNOSTIC sweep: cycle the post-0xAD delay across injections (50/100/150/200ms).
+                    const uint16_t delay = F3F4_DELAY_SWEEP[f3f4_sweep_idx % F3F4_DELAY_SWEEP_N];
+                    f3f4_sweep_idx++;
                     pending_a0_tx_ = true;
-                    pending_a0_tx_due_ms_ = now + non_nasa_tx_delay_ms;
-                    LOGW("F3/F4: WRC cycle end (84->ad) — injecting CmdA0 in %ums.", (unsigned)non_nasa_tx_delay_ms);
+                    pending_a0_tx_due_ms_ = now + delay;
+                    LOGW("F3/F4 SWEEP: scheduling poll inject at +%ums after 0xAD (step %u/%u).",
+                         (unsigned)delay, (unsigned)(((f3f4_sweep_idx - 1) % F3F4_DELAY_SWEEP_N) + 1),
+                         (unsigned)F3F4_DELAY_SWEEP_N);
                 }
             }
         }
