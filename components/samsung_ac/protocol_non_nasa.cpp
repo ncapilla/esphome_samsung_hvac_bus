@@ -26,33 +26,15 @@ namespace esphome
         static uint32_t pending_control_tx_due_ms_ = 0;
 
         // F3/F4 CmdA0 injection (impersonating the Main WRC 0x84):
-        //   The real wired remote (0x84) owns the bus. We coexist by injecting our CmdA0 in the
-        //   quiet gap right after the WRC's end-of-cycle broadcast (84->ad), reusing the WRC's
-        //   already-registered address — no separate registration. The indoor confirms an accepted
-        //   A0 with Cmd50 (20->84). Inject timing is the configurable non_nasa_tx_delay_ms (start
-        //   ~20ms into the gap; tune from YAML without recompiling if the first slot misses).
-        static bool pending_a0_tx_ = false;
-        static uint32_t pending_a0_tx_due_ms_ = 0;
-
-        // F3/F4 DIAGNOSTIC — TX-integrity + gap-response gate (the make-or-break test for Plan A).
-        // Instead of the A0, inject the WRC's own read-only Cmd52 poll (32 84 20 52) in the gap and
-        // watch for the indoor's 20->84 52 reply landing IN the gap (~150-200ms after our inject, far
-        // before the WRC's next poll ~360ms out). A reply in this window is the FIRST positive proof
-        // that (a) our TX produces a parseable frame on the wire and (b) the indoor honors a gap-
-        // injected 84->20 frame — i.e. Plan A's mechanism works and the A0 failure is A0-specific.
-        // Silence ⇒ our TX most likely isn't producing parseable frames on this hardware (next suspect:
-        // DE/driver-enable timing). The injected frame is read-only, the safest possible on the bus.
-        static bool watching_poll_reply_ = false;
-        static uint32_t poll_sent_ms_ = 0;
-        constexpr uint32_t POLL_REPLY_WINDOW_MS = 300;
-
-        // F3/F4 DIAGNOSTIC timing sweep: each successive injection (initial + the 3 resends) uses the
-        // next delay here, so ONE flash tests several post-0xAD timings. Tests the "unit wants more
-        // silence after 0xAD before it accepts a frame" lead (the WRC waits ~360ms; +20ms was ignored).
-        // Kept <= 200 so the padded poll (~110ms TX) finishes before the WRC's next poll (~+360ms).
-        static const uint16_t F3F4_DELAY_SWEEP[] = {50, 100, 150, 200};
-        static constexpr size_t F3F4_DELAY_SWEEP_N = 4;
-        static size_t f3f4_sweep_idx = 0;
+        //   The real wired remote (0x84) owns the bus. We coexist by reusing its already-registered
+        //   address — no separate registration. DannyDeGaspari's working rig writes the A0 IMMEDIATELY
+        //   after it captures the WRC's end-of-cycle 0xAD frame (lib_hvac.ser_send_hvac_msg: loop until
+        //   a frame with dst==0xAD is read, then ser.write(msg) with NO delay) — i.e. back-to-back,
+        //   contiguous with the WRC's flow, NOT after a gap. Earlier we always injected with a delay
+        //   (+20..+200ms) and the unit ignored it; the timing sweep confirmed no in-gap delay works.
+        //   So we now replicate Danny exactly: on decoding 84->ad, if a HA command is queued, transmit
+        //   the BARE A0 (no padding — padding would insert 0x00 bytes between 0xAD and our 0x32, breaking
+        //   contiguity) RIGHT THEN, inside the handler. The indoor confirms an accepted A0 with Cmd50.
 
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
@@ -877,12 +859,9 @@ namespace esphome
             }
         }
 
-        // F3/F4 injection. Production behaviour injects the queued HA command as CmdA0 from 0x84.
-        // Padding rationale (kept): our M5Stack SP3485EE auto-direction may clip frame edges; wrapping
-        // the CRC-correct frame in sacrificial 0x00 (front+back) in ONE publish_data call absorbs a
-        // late-DE head clip / early-DE tail clip. The 0x00s are inter-frame idle the receiver ignores.
-        static constexpr int A0_PAD_FRONT = 4; // sacrificial 0x00 before 0x32
-        static constexpr int A0_PAD_BACK = 6;  // sacrificial 0x00 after 0x34
+        // F3/F4: inject queued HA commands as the Main wired remote — BARE CmdA0 from 0x84 -> indoor 0x20,
+        // no padding (replicating DannyDeGaspari: a clean 14-byte frame). Called directly from the 84->ad
+        // handler so the write lands immediately/contiguous with the WRC's 0xAD, à la ser_send_hvac_msg.
         void send_requests_as_a0(MessageTarget *target)
         {
             const uint32_t now = millis();
@@ -891,26 +870,8 @@ namespace esphome
                 if (item.time_sent == 0)
                 {
                     item.time_sent = now;
-
-                    // ===== DIAGNOSTIC (Plan A gate) — TEMPORARY: inject the WRC's read-only Cmd52 poll,
-                    // NOT the A0. Frame = 32 84 20 52 + all-zero data, identical to the poll the WRC sends
-                    // every cycle; same padding so TX conditions match the A0 test. We then watch for the
-                    // indoor's 20->84 52 reply landing in the gap (watching_poll_reply_ / POLL_REPLY_WINDOW_MS).
-                    // Restore the A0 path (git commit 032147f) once we know whether the gap reply comes.
-                    std::vector<uint8_t> frame{0x32, 0x84, 0x20, 0x52, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x34};
-                    frame[12] = build_checksum(frame);
-
-                    std::vector<uint8_t> padded;
-                    padded.reserve(A0_PAD_FRONT + frame.size() + A0_PAD_BACK);
-                    padded.insert(padded.end(), A0_PAD_FRONT, 0x00);
-                    padded.insert(padded.end(), frame.begin(), frame.end());
-                    padded.insert(padded.end(), A0_PAD_BACK, 0x00);
-
-                    poll_sent_ms_ = now;
-                    watching_poll_reply_ = true;
-                    LOGW("F3/F4 DIAG: injected read-only Cmd52 poll (32 84 20 52) in gap. Watch for 20->84 52 reply IN GAP (<%ums).",
-                         (unsigned)POLL_REPLY_WINDOW_MS);
-                    target->publish_data(0, std::move(padded));
+                    LOGW("F3/F4 INJECT (immediate, Danny-style): bare CmdA0 0x84->0x20 back-to-back after 0xAD. Watch for indoor Cmd50.");
+                    target->publish_data(0, item.request.encode_as_cmd_a0("20"));
                 }
             }
         }
@@ -1192,21 +1153,6 @@ namespace esphome
             }
             else if (nonpacket_.cmd == NonNasaCommand::Cmd52 && nonpacket_.src == "20" && nonpacket_.dst == "84")
             {
-                // ===== DIAGNOSTIC (Plan A gate): is THIS 52-reply the answer to OUR injected poll?
-                // Our poll goes out in the gap; the indoor would answer ~150-200ms later, still in the
-                // gap and well before the WRC's next poll (~360ms out). So a 52-reply within the window
-                // after our inject is unambiguously ours — proof TX is parseable AND the indoor honors a
-                // gap-injected 84->20 frame. Out-of-window ⇒ that was the WRC's normal reply; stop watching.
-                if (watching_poll_reply_)
-                {
-                    const uint32_t now = millis();
-                    if ((int32_t)(now - (poll_sent_ms_ + POLL_REPLY_WINDOW_MS)) < 0)
-                        LOGW("F3/F4 DIAG *** POLL REPLY IN GAP *** indoor answered our injected Cmd52 at +%ums "
-                             "-> TX IS CLEAN and the indoor honors gap-injected 84->20 frames. Plan A alive.",
-                             (unsigned)(now - poll_sent_ms_));
-                    watching_poll_reply_ = false;
-                }
-
                 // F3/F4: we're on the wired-remote bus — the indoor's status reply (early in every
                 // WRC poll cycle) is our earliest "registered by impersonation" signal. Flip the flag
                 // here so protocol_update stops emitting F1/F2 registration frames onto this 2400 bus.
@@ -1317,35 +1263,21 @@ namespace esphome
                 for (auto &item : nonnasa_requests)
                     if (item.time_sent == 0) { queued = true; break; }
 
-                if (queued && !pending_a0_tx_)
+                if (queued)
                 {
-                    const uint32_t now = millis();
-                    // DIAGNOSTIC sweep: cycle the post-0xAD delay across injections (50/100/150/200ms).
-                    const uint16_t delay = F3F4_DELAY_SWEEP[f3f4_sweep_idx % F3F4_DELAY_SWEEP_N];
-                    f3f4_sweep_idx++;
-                    pending_a0_tx_ = true;
-                    pending_a0_tx_due_ms_ = now + delay;
-                    LOGW("F3/F4 SWEEP: scheduling poll inject at +%ums after 0xAD (step %u/%u).",
-                         (unsigned)delay, (unsigned)(((f3f4_sweep_idx - 1) % F3F4_DELAY_SWEEP_N) + 1),
-                         (unsigned)F3F4_DELAY_SWEEP_N);
+                    // Danny-style: write the BARE A0 IMMEDIATELY, right here in the 0xAD handler, so it
+                    // lands back-to-back with the WRC's end-of-cycle frame (no gap). Safe to TX inside the
+                    // decode path here: the bus is idle for ~360ms after 0xAD (nothing to receive meanwhile).
+                    LOGW("F3/F4: WRC cycle end (84->ad) — injecting bare CmdA0 IMMEDIATELY (Danny-style).");
+                    send_requests_as_a0(target);
                 }
             }
         }
 
         void NonNasaProtocol::protocol_update(MessageTarget *target)
         {
-            // F3/F4 scheduled CmdA0 injection (impersonating the Main WRC 0x84). Scheduled from the
-            // WRC's end-of-cycle broadcast (84->ad) so we transmit in the quiet gap, never inside the
-            // RX decode path. send_requests_as_a0 stamps time_sent and emits the A0 from 0x84->0x20.
-            if (pending_a0_tx_)
-            {
-                const uint32_t now = millis();
-                if ((int32_t)(now - pending_a0_tx_due_ms_) >= 0)
-                {
-                    pending_a0_tx_ = false;
-                    send_requests_as_a0(target);
-                }
-            }
+            // F3/F4 CmdA0 injection now happens immediately inside the 84->ad RX handler (Danny-style),
+            // so there is no scheduled-injection step here.
 
             // non-blocking keepalive send (scheduled from broadcast request)
             if (non_nasa_keepalive && pending_keepalive_)
