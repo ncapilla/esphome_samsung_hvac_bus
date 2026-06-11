@@ -25,34 +25,14 @@ namespace esphome
         static bool pending_control_tx_ = false;
         static uint32_t pending_control_tx_due_ms_ = 0;
 
-        // =====================================================================================
-        // F3/F4 TX DIAGNOSTIC — alternates 2 cycle types on each CmdD1:
-        //   phase 0  CLEAN         : transmit nothing (control; indoor answers the WRC at +360ms).
-        //   phase 1  PADDED PROBE  : Cmd52(0x84) wrapped in sacrificial 0x00 bytes (front AND back),
-        //                            fired at +20ms in the gap.
-        //
-        // Already settled by prior flashes: TX reaches the bus (A rejected — a 100-byte blast deferred
-        // the WRC's query and left no buffered query at unblock); flow_control_pin/GPIO23 not needed;
-        // C-tail rejected (back-padding alone got no reply).
-        //
-        // This flash discriminates the last two:
-        //   C-head (truncation)  -> probe GETS A REPLY: front-pad absorbs the late-DE clip of the real
-        //                           0x32 start byte, so the AC finally syncs to a valid frame.
-        //                           Fix = pad CmdA0 front+back in production.
-        //   B (protocol/slot)    -> probe SILENT: frame reaches the AC intact (head+tail padded, middle
-        //                           proven clean by the blast, parity/baud proven by working RX) but is
-        //                           ignored because it's out of the WRC's poll slot. No framing left.
-        static bool cycle_probe_ = false; // toggled each CmdD1: false=clean, true=padded probe
-
-        // PADDED PROBE
-        static bool pending_probe_ = false;
-        static uint32_t pending_probe_due_ms_ = 0;
-        static uint32_t probe_sent_ms_ = 0;     // when the padded probe left; used to time the reply window
-        static bool watching_probe_reply_ = false;
-        constexpr uint32_t F3F4_PROBE_DELAY_MS = 20;        // fire early in the gap
-        constexpr int F3F4_PROBE_PREFIX_BYTES = 4;          // sacrificial 0x00 BEFORE 0x32 (absorbs late-DE head clip)
-        constexpr int F3F4_PROBE_SUFFIX_BYTES = 6;          // sacrificial 0x00 AFTER 0x34 (absorbs early-DE tail clip)
-        constexpr uint32_t F3F4_PROBE_REPLY_WINDOW_MS = 250; // our reply lands ~+90ms; WRC is silent until ~+360ms
+        // F3/F4 CmdA0 injection (impersonating the Main WRC 0x84):
+        //   The real wired remote (0x84) owns the bus. We coexist by injecting our CmdA0 in the
+        //   quiet gap right after the WRC's end-of-cycle broadcast (84->ad), reusing the WRC's
+        //   already-registered address — no separate registration. The indoor confirms an accepted
+        //   A0 with Cmd50 (20->84). Inject timing is the configurable non_nasa_tx_delay_ms (start
+        //   ~20ms into the gap; tune from YAML without recompiling if the first slot misses).
+        static bool pending_a0_tx_ = false;
+        static uint32_t pending_a0_tx_due_ms_ = 0;
 
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
@@ -670,13 +650,13 @@ namespace esphome
 
         std::vector<uint8_t> NonNasaRequest::encode_as_cmd_a0(const std::string &indoor_address)
         {
-            // Use 0x85 as source — the conventional secondary master address on Samsung NonNASA.
-            // Danny De Gaspari's reference confirms this: the WRC at 0x84 doesn't notice a
-            // secondary master at 0x85 and takes over the changed state on its next status poll.
-            // data[5] is the current room temperature in Celsius (confirmed from log18 capture).
+            // Src = 0x84 (impersonate the Main WRC). Danny's 0x85 (secondary) works on HIS unit
+            // but OURS ignores 0x85 — log39 confirms the indoor only acks A0 (with Cmd50) from 0x84.
+            // Coexists with the real WRC: inject in a quiet slot; the real remote adopts the change
+            // on its next status poll. data[5] is the room temperature (0x18 default if unknown).
             std::vector<uint8_t> data{
                 0x32,                                // start
-                0x85,                                // src: secondary master (0x85) — does not conflict with WRC at 0x84
+                0x84,                                // src: impersonate the Main WRC (0x84) — our unit obeys 0x84, not 0x85
                 (uint8_t)hex_to_int(indoor_address), // dst: indoor unit (0x20)
                 0xA0,                                // cmd: CmdA0 (change settings)
                 0, 0, 0, 0, 0, 0, 0, 0,             // data[4..11]
@@ -873,6 +853,22 @@ namespace esphome
                 {
                     item.time_sent = now;
                     target->publish_data(0, item.request.encode());
+                }
+            }
+        }
+
+        // F3/F4: send queued HA commands as the Main wired remote — CmdA0 from 0x84 -> indoor 0x20.
+        // (encode_as_cmd_a0 hardcodes src 0x84; "20" is this unit's indoor address.)
+        void send_requests_as_a0(MessageTarget *target)
+        {
+            const uint32_t now = millis();
+            for (auto &item : nonnasa_requests)
+            {
+                if (item.time_sent == 0)
+                {
+                    item.time_sent = now;
+                    LOGW("F3/F4 INJECT: CmdA0 0x84->0x20 (impersonating Main WRC). Watch for indoor Cmd50 reply.");
+                    target->publish_data(0, item.request.encode_as_cmd_a0("20"));
                 }
             }
         }
@@ -1154,20 +1150,10 @@ namespace esphome
             }
             else if (nonpacket_.cmd == NonNasaCommand::Cmd52 && nonpacket_.src == "20" && nonpacket_.dst == "84")
             {
-                // ===== PADDED PROBE reply detection (diagnostic) =====
-                // This frame is also the WRC's normal poll reply (~+430ms after CmdD1). Our probe's
-                // reply lands far earlier (~+90ms), inside the watch window — so a hit here = OUR reply.
-                if (watching_probe_reply_)
-                {
-                    const uint32_t now = millis();
-                    if ((int32_t)(now - (probe_sent_ms_ + F3F4_PROBE_REPLY_WINDOW_MS)) < 0)
-                    {
-                        watching_probe_reply_ = false;
-                        LOGW("F3/F4 *** PADDED PROBE REPLY *** AC answered our wrapped 0x84 Cmd52 at +%ums "
-                             "-> TRUNCATION CONFIRMED (padding made the frame valid). "
-                             "Fix: pad CmdA0 front+back.", (unsigned)(now - probe_sent_ms_));
-                    }
-                }
+                // F3/F4: we're on the wired-remote bus — the indoor's status reply (early in every
+                // WRC poll cycle) is our earliest "registered by impersonation" signal. Flip the flag
+                // here so protocol_update stops emitting F1/F2 registration frames onto this 2400 bus.
+                controller_registered = true;
 
                 // F3/F4: indoor status response — power, set temp, room temp, fan, swing.
                 // Emitted every ~540ms cycle regardless of user interaction, unlike CmdA0.
@@ -1214,14 +1200,24 @@ namespace esphome
                 if (!pending)
                     target->set_mode("84", nonnasa_mode_to_mode(mode));
             }
-            else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "85")
+            else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "84")
             {
-                // Indoor (0x20) confirmed CmdA0 sent by the secondary master at 0x85.
-                LOGD("F3/F4 inject confirmed by indoor (Cmd50 from 20 to 85)");
-                nonnasa_requests.remove_if([&](const NonNasaRequestQueueItem &item)
+                // *** F3/F4 SUCCESS SIGNAL *** Indoor (0x20) replied Cmd50 -> 0x84, confirming a CmdA0.
+                // The indoor sends this same frame to confirm the REAL wall remote's A0 too, so only
+                // treat it as OUR control confirmation when we have an injected command in flight
+                // (time_sent > 0). Otherwise it's the user touching the wall panel — ignore it.
+                bool was_in_flight = false;
+                for (auto &item : nonnasa_requests)
+                    if (item.time_sent > 0) { was_in_flight = true; break; }
+
+                if (was_in_flight)
                 {
-                    return item.time_sent > 0;
-                });
+                    LOGW("F3/F4 *** CONTROL CONFIRMED *** indoor acked our injected CmdA0 (Cmd50 20->84).");
+                    nonnasa_requests.remove_if([&](const NonNasaRequestQueueItem &item)
+                    {
+                        return item.time_sent > 0;
+                    });
+                }
             }
             else if (nonpacket_.cmd == NonNasaCommand::Cmd54 && nonpacket_.dst == "d0")
             {
@@ -1254,70 +1250,38 @@ namespace esphome
             }
             else if (nonpacket_.src == "84" && nonpacket_.dst == "ad")
             {
-                // F3/F4: WRC (0x84) finished its polling cycle with a broadcast to 0xAD.
-                //
-                // ===== TX DIAGNOSTIC MODE =====
-                // Normal CmdA0 injection is DISABLED during this test so the log stays clean.
-                // Alternate clean / padded-probe cycles.
-                const uint32_t now = millis();
-                cycle_probe_ = !cycle_probe_;
-                if (cycle_probe_)
+                // F3/F4: the Main WRC (0x84) just closed its poll cycle with the end-of-cycle
+                // broadcast to 0xAD. The bus is now quiet until the WRC's next cycle — this gap is
+                // the slot where we inject our CmdA0 (impersonating 0x84), à la DannyDeGaspari.
+                controller_registered = true;
+
+                // Only schedule an injection when HA has queued a command not yet transmitted.
+                bool queued = false;
+                for (auto &item : nonnasa_requests)
+                    if (item.time_sent == 0) { queued = true; break; }
+
+                if (queued && !pending_a0_tx_)
                 {
-                    LOGW("F3/F4 PADDED-PROBE CYCLE: %dpre+Cmd52(0x84)+%dpost scheduled at +%ums",
-                         F3F4_PROBE_PREFIX_BYTES, F3F4_PROBE_SUFFIX_BYTES, F3F4_PROBE_DELAY_MS);
-                    if (!pending_probe_)
-                    {
-                        pending_probe_ = true;
-                        pending_probe_due_ms_ = now + F3F4_PROBE_DELAY_MS;
-                    }
+                    const uint32_t now = millis();
+                    pending_a0_tx_ = true;
+                    pending_a0_tx_due_ms_ = now + non_nasa_tx_delay_ms;
+                    LOGW("F3/F4: WRC cycle end (84->ad) — injecting CmdA0 in %ums.", (unsigned)non_nasa_tx_delay_ms);
                 }
-                // else: clean cycle — transmit nothing (in-log control baseline).
             }
         }
 
         void NonNasaProtocol::protocol_update(MessageTarget *target)
         {
-            // F3/F4 PADDED PROBE — Cmd52(src=0x84) wrapped in sacrificial 0x00 bytes front AND back.
-            // Front pad absorbs a late-DE clip of the real 0x32 start byte (C-head); back pad absorbs
-            // an early-DE clip of the 0x34 end byte (C-tail). If the AC replies within the window, the
-            // real 14-byte frame reached it intact -> truncation was the cause -> fix is to pad CmdA0.
-            if (pending_probe_)
+            // F3/F4 scheduled CmdA0 injection (impersonating the Main WRC 0x84). Scheduled from the
+            // WRC's end-of-cycle broadcast (84->ad) so we transmit in the quiet gap, never inside the
+            // RX decode path. send_requests_as_a0 stamps time_sent and emits the A0 from 0x84->0x20.
+            if (pending_a0_tx_)
             {
                 const uint32_t now = millis();
-                if ((int32_t)(now - pending_probe_due_ms_) >= 0)
+                if ((int32_t)(now - pending_a0_tx_due_ms_) >= 0)
                 {
-                    pending_probe_ = false;
-                    // Build the real 14-byte frame first so the checksum is over bytes [1..11].
-                    std::vector<uint8_t> frame{
-                        0x32, 0x84, 0x20, 0x52,
-                        0, 0, 0, 0, 0, 0, 0, 0,
-                        0, 0x34
-                    };
-                    frame[12] = build_checksum(frame);
-                    // Wrap: [prefix 0x00...] + frame + [suffix 0x00...]
-                    std::vector<uint8_t> probe;
-                    for (int i = 0; i < F3F4_PROBE_PREFIX_BYTES; i++)
-                        probe.push_back(0x00);
-                    probe.insert(probe.end(), frame.begin(), frame.end());
-                    for (int i = 0; i < F3F4_PROBE_SUFFIX_BYTES; i++)
-                        probe.push_back(0x00);
-                    LOGW("F3/F4 PADDED PROBE sent (%dpre + Cmd52 0x84->0x20 + %dpost). Watching for reply...",
-                         F3F4_PROBE_PREFIX_BYTES, F3F4_PROBE_SUFFIX_BYTES);
-                    probe_sent_ms_ = now;
-                    watching_probe_reply_ = true;
-                    target->publish_data(0, std::move(probe));
-                }
-            }
-
-            // Close the probe reply window if no reply arrived in time.
-            if (watching_probe_reply_)
-            {
-                const uint32_t now = millis();
-                if ((int32_t)(now - (probe_sent_ms_ + F3F4_PROBE_REPLY_WINDOW_MS)) >= 0)
-                {
-                    watching_probe_reply_ = false;
-                    LOGW("F3/F4 PADDED PROBE: no reply in %ums window -> frame reaches AC but is IGNORED (protocol/slot)",
-                         F3F4_PROBE_REPLY_WINDOW_MS);
+                    pending_a0_tx_ = false;
+                    send_requests_as_a0(target);
                 }
             }
 
