@@ -34,6 +34,18 @@ namespace esphome
         static bool pending_a0_tx_ = false;
         static uint32_t pending_a0_tx_due_ms_ = 0;
 
+        // F3/F4 DIAGNOSTIC — TX-integrity + gap-response gate (the make-or-break test for Plan A).
+        // Instead of the A0, inject the WRC's own read-only Cmd52 poll (32 84 20 52) in the gap and
+        // watch for the indoor's 20->84 52 reply landing IN the gap (~150-200ms after our inject, far
+        // before the WRC's next poll ~360ms out). A reply in this window is the FIRST positive proof
+        // that (a) our TX produces a parseable frame on the wire and (b) the indoor honors a gap-
+        // injected 84->20 frame — i.e. Plan A's mechanism works and the A0 failure is A0-specific.
+        // Silence ⇒ our TX most likely isn't producing parseable frames on this hardware (next suspect:
+        // DE/driver-enable timing). The injected frame is read-only, the safest possible on the bus.
+        static bool watching_poll_reply_ = false;
+        static uint32_t poll_sent_ms_ = 0;
+        constexpr uint32_t POLL_REPLY_WINDOW_MS = 300;
+
         // Track cumulative energy calculation per device address
         // Note: Energy tracker persists across device reconnections. This is intentional to maintain
         // cumulative energy across device restarts. The tracker is keyed by device address, so if
@@ -857,20 +869,12 @@ namespace esphome
             }
         }
 
-        // F3/F4: send queued HA commands as the Main wired remote — CmdA0 from 0x84 -> indoor 0x20.
-        // (encode_as_cmd_a0 hardcodes src 0x84; "20" is this unit's indoor address.)
-        //
-        // Anti-truncation padding: DannyDeGaspari's working rig sends the bare 14-byte frame from a
-        // USB-RS485 adapter (clean auto-direction). Our M5Stack SP3485EE auto-direction likely asserts
-        // DE a hair late and clips the leading 0x32 start byte, so the indoor — which only parses frames
-        // beginning with 0x32 — silently drops our A0 (matches: valid frame injected in the same post-AD
-        // gap Danny uses, zero Cmd50 reply). Wrap the (CRC-correct) frame in sacrificial 0x00 bytes in a
-        // SINGLE publish_data call (one DE assertion): the front pad absorbs a late-DE head clip, the back
-        // pad an early-DE tail clip. The 0x00s are inter-frame idle the receiver ignores; the real frame
-        // inside is byte-identical to the WRC's. Front pad is the variable under test (back-pad-alone was
-        // already ruled out in earlier probing).
-        static constexpr int A0_PAD_FRONT = 4; // sacrificial 0x00 before 0x32 (absorbs late-DE head clip)
-        static constexpr int A0_PAD_BACK = 6;  // sacrificial 0x00 after 0x34 (absorbs early-DE tail clip)
+        // F3/F4 injection. Production behaviour injects the queued HA command as CmdA0 from 0x84.
+        // Padding rationale (kept): our M5Stack SP3485EE auto-direction may clip frame edges; wrapping
+        // the CRC-correct frame in sacrificial 0x00 (front+back) in ONE publish_data call absorbs a
+        // late-DE head clip / early-DE tail clip. The 0x00s are inter-frame idle the receiver ignores.
+        static constexpr int A0_PAD_FRONT = 4; // sacrificial 0x00 before 0x32
+        static constexpr int A0_PAD_BACK = 6;  // sacrificial 0x00 after 0x34
         void send_requests_as_a0(MessageTarget *target)
         {
             const uint32_t now = millis();
@@ -879,14 +883,25 @@ namespace esphome
                 if (item.time_sent == 0)
                 {
                     item.time_sent = now;
-                    auto frame = item.request.encode_as_cmd_a0("20");
+
+                    // ===== DIAGNOSTIC (Plan A gate) — TEMPORARY: inject the WRC's read-only Cmd52 poll,
+                    // NOT the A0. Frame = 32 84 20 52 + all-zero data, identical to the poll the WRC sends
+                    // every cycle; same padding so TX conditions match the A0 test. We then watch for the
+                    // indoor's 20->84 52 reply landing in the gap (watching_poll_reply_ / POLL_REPLY_WINDOW_MS).
+                    // Restore the A0 path (git commit 032147f) once we know whether the gap reply comes.
+                    std::vector<uint8_t> frame{0x32, 0x84, 0x20, 0x52, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x34};
+                    frame[12] = build_checksum(frame);
+
                     std::vector<uint8_t> padded;
                     padded.reserve(A0_PAD_FRONT + frame.size() + A0_PAD_BACK);
                     padded.insert(padded.end(), A0_PAD_FRONT, 0x00);
                     padded.insert(padded.end(), frame.begin(), frame.end());
                     padded.insert(padded.end(), A0_PAD_BACK, 0x00);
-                    LOGW("F3/F4 INJECT: CmdA0 0x84->0x20 (%dpre+frame+%dpost, anti-truncation). Watch for indoor Cmd50.",
-                         A0_PAD_FRONT, A0_PAD_BACK);
+
+                    poll_sent_ms_ = now;
+                    watching_poll_reply_ = true;
+                    LOGW("F3/F4 DIAG: injected read-only Cmd52 poll (32 84 20 52) in gap. Watch for 20->84 52 reply IN GAP (<%ums).",
+                         (unsigned)POLL_REPLY_WINDOW_MS);
                     target->publish_data(0, std::move(padded));
                 }
             }
@@ -1169,6 +1184,21 @@ namespace esphome
             }
             else if (nonpacket_.cmd == NonNasaCommand::Cmd52 && nonpacket_.src == "20" && nonpacket_.dst == "84")
             {
+                // ===== DIAGNOSTIC (Plan A gate): is THIS 52-reply the answer to OUR injected poll?
+                // Our poll goes out in the gap; the indoor would answer ~150-200ms later, still in the
+                // gap and well before the WRC's next poll (~360ms out). So a 52-reply within the window
+                // after our inject is unambiguously ours — proof TX is parseable AND the indoor honors a
+                // gap-injected 84->20 frame. Out-of-window ⇒ that was the WRC's normal reply; stop watching.
+                if (watching_poll_reply_)
+                {
+                    const uint32_t now = millis();
+                    if ((int32_t)(now - (poll_sent_ms_ + POLL_REPLY_WINDOW_MS)) < 0)
+                        LOGW("F3/F4 DIAG *** POLL REPLY IN GAP *** indoor answered our injected Cmd52 at +%ums "
+                             "-> TX IS CLEAN and the indoor honors gap-injected 84->20 frames. Plan A alive.",
+                             (unsigned)(now - poll_sent_ms_));
+                    watching_poll_reply_ = false;
+                }
+
                 // F3/F4: we're on the wired-remote bus — the indoor's status reply (early in every
                 // WRC poll cycle) is our earliest "registered by impersonation" signal. Flip the flag
                 // here so protocol_update stops emitting F1/F2 registration frames onto this 2400 bus.
