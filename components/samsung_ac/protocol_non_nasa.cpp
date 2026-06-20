@@ -652,13 +652,15 @@ namespace esphome
 
         std::vector<uint8_t> NonNasaRequest::encode_as_cmd_a0(const std::string &indoor_address)
         {
-            // Src = 0x84 (impersonate the Main WRC). Danny's 0x85 (secondary) works on HIS unit
-            // but OURS ignores 0x85 — log39 confirms the indoor only acks A0 (with Cmd50) from 0x84.
-            // Coexists with the real WRC: inject in a quiet slot; the real remote adopts the change
-            // on its next status poll. data[5] is the room temperature (0x18 default if unknown).
+            // Src = 0x85 (impersonate the SUB wired remote, à la DannyDeGaspari). Injecting as 0x84
+            // (the Main) WORKS but the real Main remote then sees a duplicate Main on the bus and throws
+            // Error E607 ("two main controllers"). 0x85 is the Sub-remote slot, which coexists with the
+            // Main without conflict. (An earlier "our unit ignores 0x85" finding was made with the cheap
+            // M5Stack transceiver that corrupted TX — invalid; retested with the clean T-CAN485.)
+            // The indoor confirms an accepted A0 with Cmd50 to 0x85 (20->85). data[5] = room temp.
             std::vector<uint8_t> data{
                 0x32,                                // start
-                0x84,                                // src: impersonate the Main WRC (0x84) — our unit obeys 0x84, not 0x85
+                0x85,                                // src: impersonate the Sub wired remote (0x85) — coexists with the Main, no E607
                 (uint8_t)hex_to_int(indoor_address), // dst: indoor unit (0x20)
                 0xA0,                                // cmd: CmdA0 (change settings)
                 0, 0, 0, 0, 0, 0, 0, 0,             // data[4..11]
@@ -870,7 +872,7 @@ namespace esphome
                 if (item.time_sent == 0)
                 {
                     item.time_sent = now;
-                    LOGW("F3/F4 INJECT (immediate, Danny-style): bare CmdA0 0x84->0x20 back-to-back after 0xAD. Watch for indoor Cmd50.");
+                    LOGW("F3/F4 INJECT (immediate, Danny-style): bare CmdA0 0x85->0x20 (Sub) back-to-back after 0xAD. Watch for indoor Cmd50.");
                     target->publish_data(0, item.request.encode_as_cmd_a0("20"));
                 }
             }
@@ -1203,19 +1205,18 @@ namespace esphome
                 if (!pending)
                     target->set_mode("84", nonnasa_mode_to_mode(mode));
             }
-            else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "84")
+            else if (nonpacket_.cmd == NonNasaCommand::Cmd50 && nonpacket_.src == "20" && nonpacket_.dst == "85")
             {
-                // *** F3/F4 SUCCESS SIGNAL *** Indoor (0x20) replied Cmd50 -> 0x84, confirming a CmdA0.
-                // The indoor sends this same frame to confirm the REAL wall remote's A0 too, so only
-                // treat it as OUR control confirmation when we have an injected command in flight
-                // (time_sent > 0). Otherwise it's the user touching the wall panel — ignore it.
+                // *** F3/F4 SUCCESS SIGNAL *** Indoor (0x20) replied Cmd50 -> 0x85, confirming our CmdA0.
+                // We now inject as the Sub (0x85), so a 20->85 Cmd50 is UNIQUELY ours (the real Main gets
+                // its acks at 20->84). Still gate on an in-flight request for good measure.
                 bool was_in_flight = false;
                 for (auto &item : nonnasa_requests)
                     if (item.time_sent > 0) { was_in_flight = true; break; }
 
                 if (was_in_flight)
                 {
-                    LOGW("F3/F4 *** CONTROL CONFIRMED *** indoor acked our injected CmdA0 (Cmd50 20->84).");
+                    LOGW("F3/F4 *** CONTROL CONFIRMED *** indoor acked our injected CmdA0 (Cmd50 20->85, Sub).");
                     nonnasa_requests.remove_if([&](const NonNasaRequestQueueItem &item)
                     {
                         return item.time_sent > 0;
