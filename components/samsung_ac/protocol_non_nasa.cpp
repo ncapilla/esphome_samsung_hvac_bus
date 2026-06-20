@@ -1266,10 +1266,16 @@ namespace esphome
 
                 if (queued)
                 {
-                    // Danny-style: write the BARE A0 IMMEDIATELY, right here in the 0xAD handler, so it
-                    // lands back-to-back with the WRC's end-of-cycle frame (no gap). Safe to TX inside the
-                    // decode path here: the bus is idle for ~360ms after 0xAD (nothing to receive meanwhile).
-                    LOGW("F3/F4: WRC cycle end (84->ad) — injecting bare CmdA0 IMMEDIATELY (Danny-style).");
+                    // Inject the BARE A0 a few ms AFTER the 0xAD — not in the same instant we decode it.
+                    // Injecting sub-millisecond after the 0xAD collides with its tail still clearing the bus
+                    // (the WRC's DE release / our transceiver asserting on top) and the indoor drops the frame.
+                    // This is exactly why it only worked when debug logging happened to add ~3ms of latency.
+                    // Make that guard DETERMINISTIC (independent of logging). Tunable via non_nasa_tx_delay_ms
+                    // (default 5ms); still far inside the ~360ms quiet gap before the WRC's next poll. The bus
+                    // is idle here so blocking briefly is safe (we already block ~64ms for the frame TX).
+                    const uint16_t guard_ms = non_nasa_tx_delay_ms > 0 ? non_nasa_tx_delay_ms : 5;
+                    delay(guard_ms);
+                    LOGW("F3/F4: WRC cycle end (84->ad) — injecting bare CmdA0 (Sub) after %ums guard.", (unsigned)guard_ms);
                     send_requests_as_a0(target);
                 }
             }
